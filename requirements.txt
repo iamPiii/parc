@@ -2,3 +2,10 @@ huggingface-hub==1.1.2
 openai==2.7.1
 requests
 tenacity
+torch==2.7.0
+wandb==0.22.0
+numpy==2.2.6
+huggingface_hub
+timm==1.0.12
+einops
+datasetsdiffusers

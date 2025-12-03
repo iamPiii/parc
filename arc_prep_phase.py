@@ -4,8 +4,7 @@ ARC-AGI-2 PREP PHASE SCRIPT
 This runs in the **prep container**, where internet access is allowed
 
 - Download EVERYTHING you will need later in the inference phase:
-    * LLM weights (Hugging Face, etc.).
-    * Other model weights (vision models, HRMs, GNNs, etc.).
+    * VARC model weights (Hugging Face).
     * Any auxiliary data, vocab files, tokenizers...
 
 You ARE allowed to:
@@ -27,7 +26,12 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from arc_solver_llm import model_name
+# VARC imports
+try:
+    from arc_solver_varc import DEFAULT_VARC_REPO_ID, DEFAULT_VARC_CACHE_DIR
+except ImportError:
+    DEFAULT_VARC_REPO_ID = "VisionARC/offline_train_ViT"
+    DEFAULT_VARC_CACHE_DIR = "VARC/saves"
 
 
 @retry(
@@ -49,55 +53,69 @@ def download_model_with_retry(repo_id: str, cache_dir: str, local_dir: str) -> s
 
 
 def run_prep_phase(cache_dir = Path("/app/models")) -> None:
-    """Prep phase: download model(s)"""
+    """Prep phase: download VARC model checkpoint"""
     print("\n" + "=" * 60)
-    print("PREP PHASE - Downloading Models / Assets")
+    print("PREP PHASE - Downloading VARC Model Checkpoint")
     print("=" * 60)
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    local_dir = cache_dir / model_name.replace("/", "--")
+    varc_repo_id = DEFAULT_VARC_REPO_ID
+    varc_cache_dir = Path(DEFAULT_VARC_CACHE_DIR)
+    varc_local_dir = varc_cache_dir / varc_repo_id.replace("/", "--")
     
-    print(f"\n[1/4] Default example model to download: {model_name}")
-    print(f"[2/4] Using cache directory: {cache_dir}")
-    print(f"[3/4] Target local directory: {local_dir}")
+    print(f"\n[1/3] VARC checkpoint to download: {varc_repo_id}")
+    print(f"[2/3] Cache directory: {varc_cache_dir}")
+    print(f"[3/3] Target local directory: {varc_local_dir}")
 
-    if local_dir.exists() and any(local_dir.iterdir()):
-        files_count = len(list(local_dir.glob('*')))
-        if files_count >= 10:
-            print(f"\n✓ Model files found in local cache ({files_count} files), skipping download")
-            
-            print("\n" + "=" * 60)
-            print("PREP PHASE COMPLETED - Status: success")
-            print("=" * 60)
-            return
-        else:
-            print(f"\n⚠ Partial download detected ({files_count} files), will resume...")
+    # Check if already downloaded
+    checkpoint_files = list(varc_local_dir.glob("*.pth")) + list(varc_local_dir.glob("*.pt"))
+    if varc_local_dir.exists() and checkpoint_files:
+        print(f"\n✓ VARC checkpoint already exists at {varc_local_dir}")
+        print(f"  Found checkpoint: {checkpoint_files[0].name}")
+        
+        prep_results = {
+            "phase": "prep",
+            "model": varc_repo_id,
+            "status": "success",
+            "message": f"VARC checkpoint already cached at {varc_local_dir}",
+            "cache_dir": str(varc_cache_dir),
+        }
+        
+        print("\n" + "=" * 60)
+        print("PREP PHASE COMPLETED - Status: success")
+        print("=" * 60)
+        return
 
     print("(This phase requires internet access)")
 
     try:
-        print("\n[4/4] Downloading model files from Hugging Face...")
+        print("\n[Downloading] VARC checkpoint from Hugging Face...")
         print("(Using automatic retry with exponential backoff)")
         
-        local_dir.mkdir(parents=True, exist_ok=True)
+        varc_cache_dir.mkdir(parents=True, exist_ok=True)
+        varc_local_dir.mkdir(parents=True, exist_ok=True)
 
         downloaded_path = download_model_with_retry(
-            repo_id=model_name,
-            cache_dir=str(cache_dir),
-            local_dir=str(local_dir)
+            repo_id=varc_repo_id,
+            cache_dir=str(varc_cache_dir.parent),
+            local_dir=str(varc_local_dir)
         )
 
-        print(f"✓ Model files downloaded to cache: {downloaded_path}")
-        print("✓ Model download verified")
+        # Verify checkpoint file exists
+        checkpoint_files = list(Path(downloaded_path).glob("*.pth")) + list(Path(downloaded_path).glob("*.pt"))
+        if not checkpoint_files:
+            raise FileNotFoundError(f"No checkpoint file (*.pth or *.pt) found in {downloaded_path}")
+
+        print(f"✓ VARC checkpoint downloaded to: {downloaded_path}")
+        print(f"✓ Checkpoint file: {checkpoint_files[0].name}")
         files_count = len(list(Path(downloaded_path).glob('*')))
-        print(f"✓ Files in model directory: {files_count}")
+        print(f"✓ Total files in directory: {files_count}")
 
         prep_results = {
             "phase": "prep",
-            "model": model_name,
+            "model": varc_repo_id,
             "status": "success",
-            "message": f"Model downloaded to {downloaded_path}",
-            "cache_dir": str(cache_dir),
+            "message": f"VARC checkpoint downloaded to {downloaded_path}",
+            "cache_dir": str(varc_cache_dir),
         }
 
     except Exception as e:
@@ -107,7 +125,7 @@ def run_prep_phase(cache_dir = Path("/app/models")) -> None:
         
         prep_results = {
             "phase": "prep",
-            "model": model_name,
+            "model": varc_repo_id,
             "status": "failed",
             "message": str(e),
         }
