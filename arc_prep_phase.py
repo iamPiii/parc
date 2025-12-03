@@ -31,7 +31,7 @@ try:
     from arc_solver_varc import DEFAULT_VARC_REPO_ID, DEFAULT_VARC_CACHE_DIR
 except ImportError:
     DEFAULT_VARC_REPO_ID = "VisionARC/offline_train_ViT"
-    DEFAULT_VARC_CACHE_DIR = "VARC/saves"
+    DEFAULT_VARC_CACHE_DIR = "/app/models"
 
 
 @retry(

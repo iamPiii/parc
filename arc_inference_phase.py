@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, List
 
-from arc_solver_varc import ARCSolver
+from arc_solver_varc import ARCSolver, DEFAULT_VARC_REPO_ID
 from arc_utils import load_input_data, save_output_data
 
 
@@ -43,8 +43,21 @@ def run_inference_phase(input_dir: Path, output_dir: Path) -> None:
         data = load_input_data(input_dir)
         problems: List[Dict[str, Any]] = data["tasks"]
 
+        # Locate VARC checkpoint under input_dir/model (written during prep phase)
+        model_root = input_dir / "model"
+        varc_repo_id = DEFAULT_VARC_REPO_ID
+        varc_local_dir = model_root / varc_repo_id.replace("/", "--")
+        checkpoint_best = varc_local_dir / "checkpoint_best.pt"
+        checkpoint_final = varc_local_dir / "checkpoint_final.pt"
+        if checkpoint_best.exists():
+            checkpoint_path = checkpoint_best
+        elif checkpoint_final.exists():
+            checkpoint_path = checkpoint_final
+        else:
+            raise FileNotFoundError(f"VARC checkpoint not found under {varc_local_dir}")
+
         print("[2/4] Initializing ARC solver (VARC vision model)..")
-        solver = ARCSolver()  # Downloads from Hugging Face automatically if needed
+        solver = ARCSolver(checkpoint_path=str(checkpoint_path))
 
         predictions: List[Dict[str, Any]] = []
 

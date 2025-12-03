@@ -27,7 +27,7 @@ DEFAULT_VARC_REPO_ID = os.environ.get(
 )
 
 # Local cache directory for VARC checkpoints.
-DEFAULT_VARC_CACHE_DIR = os.environ.get("VARC_CACHE_DIR", "VARC/saves")
+DEFAULT_VARC_CACHE_DIR = os.environ.get("VARC_CACHE_DIR", "/app/models")
 
 class ARCSolver:
     """
