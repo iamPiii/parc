@@ -367,17 +367,32 @@ class ARCSolver:
                     example, max_cur_x, max_cur_y, rng_np, img_size=max_img_size
                 )
 
-                max_cur_x = len(example["input"][0])
-                max_cur_y = len(example["input"])
+                # Update dimensions by multiplying by scale_factor (same as VARC)
+                max_cur_x = max_cur_x * scale_factor
+                max_cur_y = max_cur_y * scale_factor
 
-                # --- Random translation within the canvas (same as ARCDataset.process_per_example) ---
-                if max_img_size > max_cur_x:
-                    x_offset = rng_np.randint(1, max_img_size - max_cur_x) if max_img_size > max_cur_x else 1
+                # Get actual grid dimensions after augmentation (for bounds checking)
+                actual_input_h = len(example["input"])
+                actual_input_w = len(example["input"][0]) if actual_input_h > 0 else 0
+                actual_output_h = len(example["output"]) if "output" in example else 0
+                actual_output_w = len(example["output"][0]) if actual_output_h > 0 else 0
+                # Use maximum dimensions for offset calculation
+                actual_max_h = max(actual_input_h, actual_output_h)
+                actual_max_w = max(actual_input_w, actual_output_w)
+                
+                # Skip if grids are too large after augmentation
+                if actual_max_h > max_img_size or actual_max_w > max_img_size:
+                    continue
+
+                # --- Random translation within the canvas ---
+                # Always enable translation during TTT
+                if_translation = True
+                if if_translation:
+                    # Use actual dimensions to ensure grids fit
+                    x_offset = rng_np.randint(1, max_img_size - actual_max_w + 1) if max_img_size > actual_max_w else 1
+                    y_offset = rng_np.randint(1, max_img_size - actual_max_h + 1) if max_img_size > actual_max_h else 1
                 else:
                     x_offset = 1
-                if max_img_size > max_cur_y:
-                    y_offset = rng_np.randint(1, max_img_size - max_cur_y) if max_img_size > max_cur_y else 1
-                else:
                     y_offset = 1
 
                 # Process input grid
