@@ -26,13 +26,8 @@ DEFAULT_VARC_REPO_ID = os.environ.get(
     "VisionARC/offline_train_ViT",
 )
 
-# Local cache directory for VARC checkpoints
-DEFAULT_VARC_CACHE_DIR = os.environ.get(
-    "VARC_CACHE_DIR",
-    "VARC/saves",
-)
-
-os.makedirs("VARC/saves", exist_ok=True)
+# Local cache directory for VARC checkpoints.
+DEFAULT_VARC_CACHE_DIR = os.environ.get("VARC_CACHE_DIR", "VARC/saves")
 
 class ARCSolver:
     """
@@ -76,12 +71,13 @@ class ARCSolver:
         self.enable_ttt = enable_ttt
         
         # Determine checkpoint path
-        if checkpoint_path:
+        ckpt_path: Optional[str] = None
+        if checkpoint_path is not None:
             # Use explicit local path if provided
             ckpt_path = checkpoint_path
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(
-                f"VARC checkpoint not found at {ckpt_path}. "
+            if not os.path.exists(ckpt_path):
+                raise FileNotFoundError(
+                    f"VARC checkpoint not found at {ckpt_path}. "
                     f"Please ensure the checkpoint was downloaded during prep phase."
                 )
         else:
