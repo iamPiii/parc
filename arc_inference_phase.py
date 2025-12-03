@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, List
 
-from arc_solver_llm import ARCSolver
+from arc_solver_varc import ARCSolver
 from arc_utils import load_input_data, save_output_data
 
 
@@ -43,8 +43,8 @@ def run_inference_phase(input_dir: Path, output_dir: Path) -> None:
         data = load_input_data(input_dir)
         problems: List[Dict[str, Any]] = data["tasks"]
 
-        print("[2/4] Initializing ARC solver (example LLM + heuristics)..")
-        solver = ARCSolver(use_vllm=True)
+        print("[2/4] Initializing ARC solver (VARC vision model)..")
+        solver = ARCSolver()  # Downloads from Hugging Face automatically if needed
 
         predictions: List[Dict[str, Any]] = []
 
@@ -95,7 +95,6 @@ def run_inference_phase(input_dir: Path, output_dir: Path) -> None:
             "num_problems_solved": sum(
                 1 for p in predictions if p.get("predicted_output") is not None
             ),
-            "vllm_available": getattr(solver, "vllm_available", False),
             "predictions": predictions,
         }
 
