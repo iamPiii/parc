@@ -1,8 +1,9 @@
+import json
 import os
 import random
 from copy import deepcopy
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Callable
 
 import numpy as np
 import torch
@@ -69,6 +70,9 @@ class ARCSolver:
         self.ttt_learning_rate = ttt_learning_rate
         self.ttt_batch_size = ttt_batch_size
         self.enable_ttt = enable_ttt
+
+        # Multi‑view inference hyperparameters
+        self.num_inference_attempts = 10
         
         # Determine checkpoint path
         ckpt_path: Optional[str] = None
@@ -159,10 +163,12 @@ class ARCSolver:
             # Use original model (zero-shot)
             model = self.model
 
-        # Run inference on test input with the (possibly fine-tuned) model
-        logits = self._forward_single_example(test_input, model=model)
-        pred_grid = logits.argmax(dim=1)[0].cpu().tolist()
-        pred_grid = self._extract_output_grid(pred_grid, x_offset=1, y_offset=1)
+        # Multi‑view inference with majority voting (similar spirit to VARC generate_predictions)
+        pred_grid = self._multi_view_inference(
+            test_input,
+            model=model,
+            train_examples=train_examples,
+        )
 
         # Clamp values to valid ARC colors 0–9
         pred_grid = [[int(max(0, min(9, v))) for v in row] for row in pred_grid]
@@ -274,7 +280,7 @@ class ARCSolver:
         
         data = []
         task_id_counter = 0
-        rng_np = RandomState(42)  # For augmenters
+        rng_np = RandomState(random.randint(0, 2**31 - 1))  # For augmenters - different seed per TTT run
         
         # Convert train_examples to ARC Example format
         arc_examples = []
@@ -315,11 +321,11 @@ class ARCSolver:
         # For each basic augmenter:
         #   - Add one geometric variant
         #   - Add 9 color‑permuted variants of that geometric variant
-        NUM_COLOR_PERMUTES = 0
-        for augmenter in basic_augmenters:
+        NUM_COLOR_PERMUTES = 9
+        for idx, augmenter in enumerate(basic_augmenters):
             try:
                 geom_task = augmenter.apply_to_task(
-                    initial_task, to_input=True, to_output=True, rng=rng_np
+                    initial_task, to_input=True, to_output=True, rng=idx
                 )
                 if not (geom_task.max_height() <= self.image_size - 2 and
                         geom_task.max_width() <= self.image_size - 2):
@@ -327,10 +333,10 @@ class ARCSolver:
                 augmented_tasks.append(geom_task)
 
                 # 9 color permutations of this geometric variant
-                for _ in range(NUM_COLOR_PERMUTES):
+                for color_idx in range(NUM_COLOR_PERMUTES):
                     perm_augmenter = PermuteColors()
                     perm_task = perm_augmenter.apply_to_task(
-                        geom_task, to_input=True, to_output=True, rng=rng_np
+                        geom_task, to_input=True, to_output=True, rng=color_idx
                     )
                     if (perm_task.max_height() <= self.image_size - 2 and
                             perm_task.max_width() <= self.image_size - 2):
@@ -392,15 +398,8 @@ class ARCSolver:
                     continue
 
                 # --- Random translation within the canvas ---
-                # Always enable translation during TTT
-                if_translation = True
-                if if_translation:
-                    # Use actual dimensions to ensure grids fit
-                    x_offset = rng_np.randint(1, max_img_size - actual_max_w + 1) if max_img_size > actual_max_w else 1
-                    y_offset = rng_np.randint(1, max_img_size - actual_max_h + 1) if max_img_size > actual_max_h else 1
-                else:
-                    x_offset = 1
-                    y_offset = 1
+                x_offset = rng_np.randint(1, max_img_size - actual_max_w + 1) if max_img_size > actual_max_w else 1
+                y_offset = rng_np.randint(1, max_img_size - actual_max_h + 1) if max_img_size > actual_max_h else 1
 
                 # Process input grid
                 input_tensor, input_mask, _, _ = pad_grid_with_translation(
@@ -466,19 +465,28 @@ class ARCSolver:
         
         return model
 
-    def _forward_single_example(self, input_grid: List[List[int]], model: Optional[torch.nn.Module] = None) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Inference helpers: multi‑view + majority vote
+    # ------------------------------------------------------------------
+
+    def _multi_view_inference(
+        self,
+        input_grid: List[List[int]],
+        model: Optional[torch.nn.Module] = None,
+        train_examples: Optional[List[Dict]] = None,
+    ) -> List[List[int]]:
         """
-        Run VARC on a single input grid.
-
-        Args:
-            input_grid: Input grid to process
-            model: Model to use (defaults to self.model)
-
-        Returns:
-            logits: (1, num_colors, H, W) tensor
+        Run multi-view inference by reusing VARC's augmentation strategy:
+        - Build a Task from train_examples + the current test input.
+        - Apply the same geometric + color augmenters (identity + 5 basics + 9 perms).
+        - For each augmented test example, run resolution augmentation + translation
+          exactly like ARCDataset.process_per_example.
+        - Run the model on each view, undo transforms, downsample if needed, revert
+          color maps, then majority vote.
         """
         if model is None:
             model = self.model
+
         h = len(input_grid)
         w = len(input_grid[0]) if h > 0 else 0
         if h == 0 or w == 0:
@@ -489,28 +497,355 @@ class ARCSolver:
                 f"Grid {h}x{w} is too large for image_size={self.image_size}."
             )
 
-        # Place the grid on a 30x30 canvas with a 1‑pixel border (like VARC loader)
-        canvas = torch.full(
-            (self.image_size, self.image_size),
-            IGNORE_INDEX,
-            dtype=torch.long,
+        # Deterministic base seed per problem
+        seed_input = json.dumps(input_grid)
+        base_seed = int.from_bytes(seed_input.encode("utf-8"), "little") % (2**31)
+
+        # Build augmented auxiliary tasks (≈51) using the same pipeline as VARC
+        aux_tasks = self._build_augmented_test_views(
+            train_examples=train_examples,
+            test_input=input_grid,
+            base_seed=base_seed,
         )
-        mask = torch.zeros((self.image_size, self.image_size), dtype=torch.long)
 
-        x_offset, y_offset = 1, 1
-        canvas[y_offset:y_offset + h, x_offset:x_offset + w] = torch.tensor(
-            input_grid, dtype=torch.long
+        if not aux_tasks:
+            raise RuntimeError(
+                "Failed to build auxiliary tasks. This should not happen if train_examples are provided."
+            )
+
+        predictions: List[List[List[int]]] = []
+
+        # For each auxiliary task, run num_inference_attempts
+        # stochastic views (resolution + translation), then aggregate over all.
+        rng_seq = RandomState(base_seed or 1)
+
+        def next_seed() -> int:
+            return int(rng_seq.randint(0, 2**31 - 1))
+
+        for _ in range(self.num_inference_attempts):
+            for aux in aux_tasks:
+                task_obj: Task = aux["task"]
+                undo_fn = aux["undo_fn"]
+                color_inverse_map = aux["color_inverse_map"]
+
+                # Compute max dimensions from AUGMENTED train examples in this task
+                max_aug_train_output_h = 0
+                max_aug_train_output_w = 0
+                for train_ex in task_obj.train_examples:
+                    out_h = train_ex.output.shape[0] if len(train_ex.output.shape) >= 2 else 0
+                    out_w = train_ex.output.shape[1] if len(train_ex.output.shape) >= 2 else 0
+                    max_aug_train_output_h = max(max_aug_train_output_h, out_h)
+                    max_aug_train_output_w = max(max_aug_train_output_w, out_w)
+
+                example_dict = {
+                    "input": deepcopy(task_obj.test_example.input.tolist()),
+                    "output": deepcopy(task_obj.test_example.output.tolist()),
+                }
+                view = self._process_example_for_inference(
+                    example=example_dict,
+                    seed=next_seed(),
+                    max_train_output_h=max_aug_train_output_h,
+                    max_train_output_w=max_aug_train_output_w,
+                )
+                if view is None:
+                    continue
+
+                inputs = view["inputs"].unsqueeze(0).to(self.device)
+                attention_mask = view["attention_mask"].unsqueeze(0).to(self.device)
+                task_ids = torch.zeros(1, dtype=torch.long, device=self.device)
+
+                with torch.no_grad():
+                    logits = model(inputs, task_ids, attention_mask=attention_mask)
+
+                pred_full = logits.argmax(dim=1)[0].cpu().tolist()
+                pred_grid = self._extract_output_grid(
+                    pred_full,
+                    x_offset=view["x_offset"],
+                    y_offset=view["y_offset"],
+                )
+
+                # Undo spatial transform
+                pred_arr = undo_fn(np.array(pred_grid, dtype=int))
+                pred_grid = pred_arr.tolist()
+
+                # Downsample if resolution augmentation scaled the example
+                if view["scale_factor"] > 1:
+                    pred_grid = self._downsample_by_scale(pred_grid, view["scale_factor"])
+
+                # Revert color permutations if any
+                if color_inverse_map:
+                    pred_grid = self._apply_color_inverse(pred_grid, color_inverse_map)
+
+                predictions.append(pred_grid)
+
+        voted = self._get_majority_vote(predictions)
+        if not voted:
+            return predictions[-1]
+
+        return voted[0]["prediction"]
+
+    @staticmethod
+    def _get_majority_vote(predictions: List[List[List[int]]]) -> List[Dict]:
+        """
+        Majority vote over a list of grid predictions.
+        Mirrors VARC's utils.eval_utils_ttt.get_majority_vote.
+        """
+        vote_count: Dict[str, int] = {}
+        list_map: Dict[str, List[List[int]]] = {}
+
+        for grid in predictions:
+            label = json.dumps(grid)
+            list_map[label] = grid
+            if label not in vote_count:
+                vote_count[label] = 0
+            vote_count[label] += 1
+
+        if not vote_count:
+            return []
+
+        sorted_votes = sorted(vote_count.items(), key=lambda x: x[1], reverse=True)
+        sorted_lists = [
+            {"prediction": list_map[item[0]], "votes": item[1]} for item in sorted_votes
+        ]
+        return sorted_lists
+
+    @staticmethod
+    def _downsample_by_scale(predict_grid: List[List[int]], scale_factor: int) -> List[List[int]]:
+        """
+        Downsample a high‑resolution prediction grid back to the base resolution
+        by block‑wise majority vote, mirroring VARC's eval_utils_ttt logic.
+        """
+        if scale_factor <= 1:
+            return predict_grid
+
+        h = len(predict_grid)
+        w = len(predict_grid[0]) if h > 0 else 0
+        if h == 0 or w == 0:
+            return predict_grid
+
+        downsampled: List[List[int]] = []
+        for i in range(0, h, scale_factor):
+            row: List[int] = []
+            for j in range(0, w, scale_factor):
+                block: List[int] = []
+                for di in range(scale_factor):
+                    for dj in range(scale_factor):
+                        yi = i + di
+                        xj = j + dj
+                        if yi < h and xj < w:
+                            block.append(int(predict_grid[yi][xj]))
+                if block:
+                    counts = np.bincount(block)
+                    majority_value = int(np.argmax(counts))
+                    row.append(majority_value)
+            if row:
+                downsampled.append(row)
+
+        return downsampled
+
+    # ------------------------------------------------------------------
+    # Augmented view generation helpers
+    # ------------------------------------------------------------------
+
+    def _build_augmented_test_views(
+        self,
+        train_examples: Optional[List[Dict]],
+        test_input: List[List[int]],
+        base_seed: int,
+    ) -> List[Dict]:
+        """
+        Generate augmented auxiliary tasks mirroring VARC's augmentation stack:
+        identity + 5 basic geometric transforms + 9 color permutations each.
+        """
+        arc_train_examples: List[Example] = []
+        for example in train_examples:
+            if "input" not in example or "output" not in example:
+                continue
+            arc_train_examples.append(
+                Example(input=np.array(example["input"]), output=np.array(example["output"]))
+            )
+
+        if not arc_train_examples:
+            return []
+
+        test_example = Example(
+            input=np.array(test_input),
+            output=np.array(test_input),
         )
-        mask[y_offset:y_offset + h, x_offset:x_offset + w] = 1
 
-        canvas = canvas.unsqueeze(0).to(self.device)         # (1, H, W)
-        mask = mask.unsqueeze(0).to(self.device)             # (1, H, W)
-        task_ids = torch.zeros(1, dtype=torch.long).to(self.device)  # single task_id = 0
+        base_task = Task(
+            name="",
+            train_examples=arc_train_examples,
+            test_example=test_example,
+        )
 
-        with torch.no_grad():
-            logits = model(canvas, task_ids, attention_mask=mask)
+        rng_np = RandomState(base_seed or 1)
+        aux_tasks: List[Dict] = []
 
-        return logits
+        def next_seed() -> int:
+            return int(rng_np.randint(0, 2**31 - 1))
+
+        # Identity task
+        aux_tasks.append(
+            {
+                "task": base_task,
+                "undo_fn": self._identity_np,
+                "color_inverse_map": None,
+            }
+        )
+
+        basic_augmenters = get_basic_augmenters()
+        NUM_COLOR_PERMUTES = 9
+
+        for augmenter in basic_augmenters:
+            geom_task = augmenter.apply_to_task(
+                base_task,
+                rng=RandomState(next_seed()),
+                to_input=True,
+                to_output=True,
+            )
+            if not self._task_fits_canvas(geom_task):
+                continue
+
+            undo_fn = self._get_undo_fn_for_augmenter(augmenter)
+            aux_tasks.append(
+                {
+                    "task": geom_task,
+                    "undo_fn": undo_fn,
+                    "color_inverse_map": None,
+                }
+            )
+
+            for _ in range(NUM_COLOR_PERMUTES):
+                perm_augmenter = PermuteColors()
+                perm_task = perm_augmenter.apply_to_task(
+                    geom_task,
+                    rng=RandomState(next_seed()),
+                    to_input=True,
+                    to_output=True,
+                    use_test_output=False,  # Only use train outputs + test input for color map
+                )
+                if not self._task_fits_canvas(perm_task):
+                    continue
+                color_map = getattr(perm_augmenter, "_color_map", None)
+                color_inverse = {v: k for k, v in color_map.items()} if color_map else None
+                aux_tasks.append(
+                    {
+                        "task": perm_task,
+                        "undo_fn": undo_fn,
+                        "color_inverse_map": color_inverse,
+                    }
+                )
+
+        return aux_tasks
+
+    def _process_example_for_inference(
+        self,
+        example: Dict[str, List[List[int]]],
+        seed: int,
+        max_train_output_h: int = 0,
+        max_train_output_w: int = 0,
+    ) -> Optional[Dict]:
+        """
+        Mirror ARCDataset.process_per_example for a single example (resolution aug +
+        translation + padding). Returns tensors and metadata required for inference.
+        """
+        max_img_size = self.image_size - 2
+        example_copy = {
+            "input": deepcopy(example["input"]),
+            "output": deepcopy(example["output"]),
+        }
+
+        rng = random.Random(seed or 1)
+
+        # Compute bounds from test input + max train output dimensions
+        test_input_h = len(example_copy["input"])
+        test_input_w = len(example_copy["input"][0]) if test_input_h > 0 else 0
+        max_cur_y = max(test_input_h, max_train_output_h)
+        max_cur_x = max(test_input_w, max_train_output_w)
+
+        if max_cur_y == 0 or max_cur_x == 0:
+            return None
+
+        if max_cur_y > max_img_size or max_cur_x > max_img_size:
+            return None
+
+        max_len = max(max_cur_x, max_cur_y)
+        max_scale_factor = (max_img_size // max_len) if max_len > 0 else 1
+
+        if max_scale_factor > 1:
+            example_copy, scale_factor = resolution_augmentation(
+                example_copy, max_cur_x, max_cur_y, rng, img_size=max_img_size
+            )
+        else:
+            scale_factor = 1
+
+        max_cur_x = max_cur_x * scale_factor
+        max_cur_y = max_cur_y * scale_factor
+
+        # Check if scaled dimensions fit
+        if max_cur_y > max_img_size or max_cur_x > max_img_size:
+            return None
+
+        # Translation offsets: use theoretical scaled dimensions
+        if max_img_size > max_cur_x:
+            x_offset = rng.randint(1, max_img_size - max_cur_x)
+        else:
+            x_offset = 1
+
+        if max_img_size > max_cur_y:
+            y_offset = rng.randint(1, max_img_size - max_cur_y)
+        else:
+            y_offset = 1
+
+        input_tensor, input_mask, _, _ = pad_grid_with_translation(
+            example_copy["input"], self.image_size, x_offset, y_offset, output_shape=False
+        )
+
+        return {
+            "inputs": input_tensor,
+            "attention_mask": input_mask,
+            "x_offset": x_offset,
+            "y_offset": y_offset,
+            "scale_factor": scale_factor,
+        }
+
+    def _task_fits_canvas(self, task: Task) -> bool:
+        max_dim = self.image_size - 2
+        return task.max_height() <= max_dim and task.max_width() <= max_dim
+
+    @staticmethod
+    def _identity_np(arr: np.ndarray) -> np.ndarray:
+        return arr
+
+    def _get_undo_fn_for_augmenter(self, augmenter) -> Callable[[np.ndarray], np.ndarray]:
+        from VARC.utils.arclib.augmenters import Rotate, Flip  # local import to avoid cycle
+
+        if isinstance(augmenter, Rotate):
+            angle = augmenter.angle
+            if angle == 90:
+                return lambda arr: np.rot90(arr, k=3)
+            if angle == 180:
+                return lambda arr: np.rot90(arr, k=2)
+            if angle == 270:
+                return lambda arr: np.rot90(arr, k=1)
+        elif isinstance(augmenter, Flip):
+            axis = augmenter.axis
+            if axis == 0:
+                return lambda arr: np.flipud(arr)
+            if axis == 1:
+                return lambda arr: np.fliplr(arr)
+        return self._identity_np
+
+    @staticmethod
+    def _apply_color_inverse(
+        grid: List[List[int]], color_inverse_map: Dict[int, int]
+    ) -> List[List[int]]:
+        return [
+            [color_inverse_map.get(int(value), int(value)) for value in row]
+            for row in grid
+        ]
+
 
     def _extract_output_grid(self, pred: List[List[int]], x_offset: int, y_offset: int) -> List[List[int]]:
         """
