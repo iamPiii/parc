@@ -503,11 +503,6 @@ class ARCSolver:
         )
         mask[y_offset:y_offset + h, x_offset:x_offset + w] = 1
 
-        # Add PAD border on the right/bottom so `_extrac_grid`‑style post‑processing works.
-        canvas[y_offset:y_offset + h, x_offset + w] = PAD_INDEX
-        canvas[y_offset + h, x_offset:x_offset + w + 1] = PAD_INDEX
-        mask[y_offset:y_offset + h + 1, x_offset:x_offset + w + 1] = 1
-
         canvas = canvas.unsqueeze(0).to(self.device)         # (1, H, W)
         mask = mask.unsqueeze(0).to(self.device)             # (1, H, W)
         task_ids = torch.zeros(1, dtype=torch.long).to(self.device)  # single task_id = 0
