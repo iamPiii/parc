@@ -162,9 +162,7 @@ class ARCSolver:
         # Run inference on test input with the (possibly fine-tuned) model
         logits = self._forward_single_example(test_input, model=model)
         pred_grid = logits.argmax(dim=1)[0].cpu().tolist()
-
-        # Strip padding / border if present
-        pred_grid = self._strip_padding(pred_grid)
+        pred_grid = self._extract_output_grid(pred_grid, x_offset=1, y_offset=1)
 
         # Clamp values to valid ARC colors 0–9
         pred_grid = [[int(max(0, min(9, v))) for v in row] for row in pred_grid]
@@ -317,7 +315,7 @@ class ARCSolver:
         # For each basic augmenter:
         #   - Add one geometric variant
         #   - Add 9 color‑permuted variants of that geometric variant
-        NUM_COLOR_PERMUTES = 9
+        NUM_COLOR_PERMUTES = 1
         for augmenter in basic_augmenters:
             try:
                 geom_task = augmenter.apply_to_task(
@@ -362,10 +360,19 @@ class ARCSolver:
                     max_cur_x = max(max_cur_x, len(example["output"][0]))
 
                 max_img_size = self.image_size - 2  # leave 1‑cell border on each side
-                # Apply resolution_augmentation (scales up grids)
-                example, scale_factor = resolution_augmentation(
-                    example, max_cur_x, max_cur_y, rng_np, img_size=max_img_size
-                )
+                
+                # Check if resolution augmentation is possible
+                max_len = max(max_cur_x, max_cur_y)
+                max_scale_factor = (max_img_size // max_len) if max_len > 0 else 1
+                
+                # Apply resolution_augmentation only if scaling is possible
+                if max_scale_factor > 1:
+                    example, scale_factor = resolution_augmentation(
+                        example, max_cur_x, max_cur_y, rng_np, img_size=max_img_size
+                    )
+                else:
+                    # Grid is already too large or at max size, skip augmentation
+                    scale_factor = 1
 
                 # Update dimensions by multiplying by scale_factor (same as VARC)
                 max_cur_x = max_cur_x * scale_factor
@@ -510,19 +517,48 @@ class ARCSolver:
 
         return logits
 
-    def _strip_padding(self, grid: List[List[int]]) -> List[List[int]]:
+    def _extract_output_grid(self, pred: List[List[int]], x_offset: int, y_offset: int) -> List[List[int]]:
         """
-        Remove VARC PAD_INDEX border and trailing padding, returning a tight grid.
+        Extract output grid from model prediction using VARC's extrac_grid logic.
+        
+        Args:
+            pred: Full canvas prediction (image_size x image_size)
+            x_offset: X offset where input was placed
+            y_offset: Y offset where input was placed
+            
+        Returns:
+            Extracted output grid (cropped to actual output size)
         """
-        import numpy as np
+        
+        np_predict = np.array(pred).reshape(self.image_size, self.image_size)
+        np_predict_grid = np_predict[y_offset:, x_offset:]
+        
+        # Find the actual output dimensions by scanning until PAD_INDEX
+        len_x, len_y = 0, 0
+        while len_x < np_predict_grid.shape[1] and np_predict_grid[0][len_x] != PAD_INDEX:
+            len_x += 1
 
-        arr = np.array(grid)
-        # Remove rows/cols that are entirely IGNORE_INDEX or PAD_INDEX
-        mask = ~np.isin(arr, [IGNORE_INDEX, PAD_INDEX])
-        if not mask.any():
-            return [[0]]  # extremely degenerate case
-
-        rows = np.where(mask.any(axis=1))[0]
-        cols = np.where(mask.any(axis=0))[0]
-        cropped = arr[rows.min(): rows.max() + 1, cols.min(): cols.max() + 1]
-        return cropped.tolist()
+        while len_y < np_predict_grid.shape[0] and np_predict_grid[len_y][0] != PAD_INDEX:
+            len_y += 1
+        
+        # If PAD_INDEX not found, fall back to finding actual content region
+        if len_x >= np_predict_grid.shape[1] or len_y >= np_predict_grid.shape[0]:
+            mask = ~np.isin(np_predict_grid, [IGNORE_INDEX, PAD_INDEX])
+            if mask.any():
+                rows = np.where(mask.any(axis=1))[0]
+                cols = np.where(mask.any(axis=0))[0]
+                if len(rows) > 0 and len(cols) > 0:
+                    len_y = rows.max() + 1
+                    len_x = cols.max() + 1
+                else:
+                    return [[0]]
+            else:
+                return [[0]]
+        
+        # Extract the actual output grid
+        predict_grid = np_predict_grid[:len_y, :len_x].tolist()
+        
+        if not predict_grid or (len_y == 0 or len_x == 0):
+            return [[0]]
+        
+        return predict_grid
