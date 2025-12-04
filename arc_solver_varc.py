@@ -315,7 +315,7 @@ class ARCSolver:
         # For each basic augmenter:
         #   - Add one geometric variant
         #   - Add 9 color‑permuted variants of that geometric variant
-        NUM_COLOR_PERMUTES = 1
+        NUM_COLOR_PERMUTES = 0
         for augmenter in basic_augmenters:
             try:
                 geom_task = augmenter.apply_to_task(
