@@ -156,18 +156,30 @@ class ARCSolver:
         Returns:
             2D grid (list of lists) of ints in [0, 9].
         """
+        # Deterministic base seed per problem
+        seed_input = json.dumps(test_input)
+        base_seed = int.from_bytes(seed_input.encode("utf-8"), "little") % (2**31)
+
+        # Build auxiliary tasks (identity + 5 geoms × 10 color perms) once
+        aux_tasks = self._build_auxiliary_tasks(
+            train_examples=train_examples,
+            test_input=test_input,
+            base_seed=base_seed,
+        )
+
         if self.enable_ttt and train_examples:
-            # Perform test-time training on training examples
-            model = self._test_time_train(train_examples)
+            # Perform test-time training on auxiliary tasks
+            model = self._test_time_train(aux_tasks)
         else:
             # Use original model (zero-shot)
             model = self.model
 
-        # Multi‑view inference with majority voting (similar spirit to VARC generate_predictions)
+        # Multi‑view inference with the same auxiliary tasks
         pred_grid = self._multi_view_inference(
             test_input,
             model=model,
-            train_examples=train_examples,
+            aux_tasks=aux_tasks,
+            base_seed=base_seed,
         )
 
         # Clamp values to valid ARC colors 0–9
@@ -179,7 +191,7 @@ class ARCSolver:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _test_time_train(self, train_examples: List[Dict]) -> torch.nn.Module:
+    def _test_time_train(self, aux_tasks: List[Dict]) -> torch.nn.Module:
         """
         Perform test-time training on training examples with augmentation.
         
@@ -187,8 +199,11 @@ class ARCSolver:
             Fine-tuned model (deep copy, original model unchanged)
         """
 
-        # Prepare augmented training data with unique task IDs
-        train_data, num_augmented_tasks = self._prepare_ttt_data_with_augmentation(train_examples)
+        # Prepare augmented training data with unique task IDs (aligned with aux tasks)
+        train_data, num_augmented_tasks = self._prepare_ttt_data_from_auxiliary_tasks(aux_tasks)
+        if not train_data:
+            print("TTT skipped: no usable augmented training data.")
+            return self.model
 
         
         # Deep copy model to avoid modifying the original
@@ -263,169 +278,80 @@ class ARCSolver:
         model.eval()
         return model
     
-    def _prepare_ttt_data_with_augmentation(self, train_examples: List[Dict]) -> Tuple[List[Dict], int]:
+    def _prepare_ttt_data_from_auxiliary_tasks(self, aux_tasks: List[Dict]) -> Tuple[List[Dict], int]:
         """
-        Prepare training examples for TTT with augmentation.
-        Creates augmented versions following VARC's approach:
-        - For each training example, create a Task where that example is the test_example
-          and other examples are train_examples
-        - Augment the entire task (both train and test examples together)
-        - Each augmented task gets a unique task_id
+        Prepare TTT batches directly from pre-built auxiliary tasks.
         
-        Returns:
-            Tuple of (list of dicts with 'input', 'attention_mask', 'target', 'task_id', and number of unique tasks)
+        Each auxiliary task already encodes the geometric + color transform. We only apply
+        resolution augmentation and random translation like ARCDataset.process_per_example,
+        and we keep the provided task_id for its task embedding.
         """
-        # 5 Geometric augmenters used by VARC for TTT data generation
-        basic_augmenters = get_basic_augmenters()
-        
-        data = []
-        task_id_counter = 0
-        rng_np = RandomState(random.randint(0, 2**31 - 1))  # For augmenters - different seed per TTT run
-        
-        # Convert train_examples to ARC Example format
-        arc_examples = []
-        for example in train_examples:
-            if "input" not in example or "output" not in example:
-                continue
-            
-            input_grid = np.array(example["input"])
-            output_grid = np.array(example["output"])
-            
-            # Check size constraints
-            h = max(len(input_grid), len(output_grid))
-            w = max(input_grid.shape[1] if len(input_grid.shape) > 1 else 0,
-                   output_grid.shape[1] if len(output_grid.shape) > 1 else 0)
-            
-            if h > self.image_size - 2 or w > self.image_size - 2:
-                continue  # Skip examples that are too large
-            
-            arc_examples.append(Example(input=input_grid, output=output_grid))
-        
-        if not arc_examples:
-            return data, task_id_counter
-        
-        # Create a single task with all examples as train_examples
-        # For TTT, we use all examples as training data (no test_example needed during training)
-        # We'll use the first example as a placeholder test_example for the Task structure
-        initial_task = Task(
-            name="",
-            train_examples=arc_examples,
-            test_example=arc_examples[0]  # Placeholder, not used during training
-        )
-        
-        # Augment the task (all examples get augmented together)
-        augmented_tasks = []
-        # Add original (identity) version
-        augmented_tasks.append(initial_task)
+        data: List[Dict] = []
+        if not aux_tasks:
+            return data, 0
 
-        # For each basic augmenter:
-        #   - Add one geometric variant
-        #   - Add 9 color‑permuted variants of that geometric variant
-        NUM_COLOR_PERMUTES = 9
-        for idx, augmenter in enumerate(basic_augmenters):
-            try:
-                geom_task = augmenter.apply_to_task(
-                    initial_task, to_input=True, to_output=True, rng=idx
-                )
-                if not (geom_task.max_height() <= self.image_size - 2 and
-                        geom_task.max_width() <= self.image_size - 2):
-                    continue
-                augmented_tasks.append(geom_task)
+        rng_py = random.Random(random.randint(0, 2**31 - 1))
+        max_img_size = self.image_size - 2  # leave border on each side
 
-                # 9 color permutations of this geometric variant
-                for color_idx in range(NUM_COLOR_PERMUTES):
-                    perm_augmenter = PermuteColors()
-                    perm_task = perm_augmenter.apply_to_task(
-                        geom_task, to_input=True, to_output=True, rng=color_idx
-                    )
-                    if (perm_task.max_height() <= self.image_size - 2 and
-                            perm_task.max_width() <= self.image_size - 2):
-                        augmented_tasks.append(perm_task)
-            except Exception:
-                continue  # Skip if augmentation fails
-        
-        # Process each augmented task and assign a DISTINCT task_id to each augmented task
-        for aug_task in augmented_tasks:
+        for aux in aux_tasks:
+            task: Task = aux["task"]
+            task_id = aux["task_id"]
 
-            # Process all train_examples (these are the actual training examples)
-            for train_example in aug_task.train_examples:
+            for train_example in task.train_examples:
                 aug_input = train_example.input
                 aug_output = train_example.output
 
-                # Convert to python lists for resolution_augmentation
                 input_grid_list = aug_input.tolist() if isinstance(aug_input, np.ndarray) else aug_input
                 output_grid_list = aug_output.tolist() if isinstance(aug_output, np.ndarray) else aug_output
-
                 example = {"input": input_grid_list, "output": output_grid_list}
 
-                # --- Resolution augmentation (same as ARCDataset.process_per_example) ---
+                # Resolution augmentation (identical to ARCDataset.process_per_example)
                 max_cur_y = len(example["input"])
                 max_cur_x = len(example["input"][0])
-                if "output" in example:
-                    max_cur_y = max(max_cur_y, len(example["output"]))
-                    max_cur_x = max(max_cur_x, len(example["output"][0]))
+                max_cur_y = max(max_cur_y, len(example["output"]))
+                max_cur_x = max(max_cur_x, len(example["output"][0]))
 
-                max_img_size = self.image_size - 2  # leave 1‑cell border on each side
-                
-                # Check if resolution augmentation is possible
                 max_len = max(max_cur_x, max_cur_y)
                 max_scale_factor = (max_img_size // max_len) if max_len > 0 else 1
-                
-                # Apply resolution_augmentation only if scaling is possible
+
                 if max_scale_factor > 1:
                     example, scale_factor = resolution_augmentation(
-                        example, max_cur_x, max_cur_y, rng_np, img_size=max_img_size
+                        example, max_cur_x, max_cur_y, rng_py, img_size=max_img_size
                     )
                 else:
-                    # Grid is already too large or at max size, skip augmentation
                     scale_factor = 1
 
-                # Update dimensions by multiplying by scale_factor (same as VARC)
-                max_cur_x = max_cur_x * scale_factor
-                max_cur_y = max_cur_y * scale_factor
+                max_cur_x *= scale_factor
+                max_cur_y *= scale_factor
 
-                # Get actual grid dimensions after augmentation (for bounds checking)
-                actual_input_h = len(example["input"])
-                actual_input_w = len(example["input"][0]) if actual_input_h > 0 else 0
-                actual_output_h = len(example["output"]) if "output" in example else 0
-                actual_output_w = len(example["output"][0]) if actual_output_h > 0 else 0
-                # Use maximum dimensions for offset calculation
-                actual_max_h = max(actual_input_h, actual_output_h)
-                actual_max_w = max(actual_input_w, actual_output_w)
-                
-                # Skip if grids are too large after augmentation
-                if actual_max_h > max_img_size or actual_max_w > max_img_size:
+                # Skip if grids are too large after scaling
+                if max_cur_y > max_img_size or max_cur_x > max_img_size:
                     continue
 
-                # --- Random translation within the canvas ---
-                x_offset = rng_np.randint(1, max_img_size - actual_max_w + 1) if max_img_size > actual_max_w else 1
-                y_offset = rng_np.randint(1, max_img_size - actual_max_h + 1) if max_img_size > actual_max_h else 1
+                # Random translation
+                x_offset = rng_py.randint(1, max_img_size - max_cur_x + 1) if max_img_size > max_cur_x else 1
+                y_offset = rng_py.randint(1, max_img_size - max_cur_y + 1) if max_img_size > max_cur_y else 1
 
-                # Process input grid
                 input_tensor, input_mask, _, _ = pad_grid_with_translation(
                     example["input"], self.image_size, x_offset, y_offset, output_shape=False
                 )
-
-                # Process output grid (target)
                 target_tensor, target_mask, _, _ = pad_grid_with_translation(
                     example["output"], self.image_size, x_offset, y_offset, output_shape=True
                 )
-
-                # Set invalid positions to IGNORE_INDEX
                 target_tensor = target_tensor.clone()
                 target_tensor[target_mask == 0] = IGNORE_INDEX
 
-                data.append({
-                    "input": input_tensor,
-                    "attention_mask": input_mask,
-                    "target": target_tensor,
-                    "task_id": task_id_counter,
-                })
+                data.append(
+                    {
+                        "input": input_tensor,
+                        "attention_mask": input_mask,
+                        "target": target_tensor,
+                        "task_id": task_id,
+                    }
+                )
 
-            # Increment task_id for the next augmented task
-            task_id_counter += 1
-        
-        return data, task_id_counter
+        num_tasks = len({item["task_id"] for item in data}) if data else len(aux_tasks)
+        return data, num_tasks
     
     def _expand_model_task_tokens(self, model: torch.nn.Module, num_tasks: int) -> torch.nn.Module:
         """
@@ -473,7 +399,8 @@ class ARCSolver:
         self,
         input_grid: List[List[int]],
         model: Optional[torch.nn.Module] = None,
-        train_examples: Optional[List[Dict]] = None,
+        aux_tasks: Optional[List[Dict]] = None,
+        base_seed: Optional[int] = None,
     ) -> List[List[int]]:
         """
         Run multi-view inference by reusing VARC's augmentation strategy:
@@ -497,16 +424,14 @@ class ARCSolver:
                 f"Grid {h}x{w} is too large for image_size={self.image_size}."
             )
 
-        # Deterministic base seed per problem
-        seed_input = json.dumps(input_grid)
-        base_seed = int.from_bytes(seed_input.encode("utf-8"), "little") % (2**31)
+        # Deterministic base seed per problem if not provided
+        if base_seed is None:
+            seed_input = json.dumps(input_grid)
+            base_seed = int.from_bytes(seed_input.encode("utf-8"), "little") % (2**31)
 
-        # Build augmented auxiliary tasks (≈51) using the same pipeline as VARC
-        aux_tasks = self._build_augmented_test_views(
-            train_examples=train_examples,
-            test_input=input_grid,
-            base_seed=base_seed,
-        )
+        # Build augmented auxiliary tasks (51) if not precomputed
+        if aux_tasks is None:
+            raise ValueError("aux_tasks must be provided for inference to align with TTT.")
 
         if not aux_tasks:
             raise RuntimeError(
@@ -527,6 +452,7 @@ class ARCSolver:
                 task_obj: Task = aux["task"]
                 undo_fn = aux["undo_fn"]
                 color_inverse_map = aux["color_inverse_map"]
+                task_id = aux["task_id"]
 
                 # Compute max dimensions from AUGMENTED train examples in this task
                 max_aug_train_output_h = 0
@@ -552,7 +478,7 @@ class ARCSolver:
 
                 inputs = view["inputs"].unsqueeze(0).to(self.device)
                 attention_mask = view["attention_mask"].unsqueeze(0).to(self.device)
-                task_ids = torch.zeros(1, dtype=torch.long, device=self.device)
+                task_ids = torch.tensor([task_id], dtype=torch.long, device=self.device)
 
                 with torch.no_grad():
                     logits = model(inputs, task_ids, attention_mask=attention_mask)
@@ -647,15 +573,15 @@ class ARCSolver:
     # Augmented view generation helpers
     # ------------------------------------------------------------------
 
-    def _build_augmented_test_views(
+    def _build_auxiliary_tasks(
         self,
         train_examples: Optional[List[Dict]],
         test_input: List[List[int]],
         base_seed: int,
     ) -> List[Dict]:
         """
-        Generate augmented auxiliary tasks mirroring VARC's augmentation stack:
-        identity + 5 basic geometric transforms + 9 color permutations each.
+        Build 51 tasks: 1 original + 5 geometric transforms × 10 color permutations.
+        Each task gets a distinct task_id and an undo/color map for inference.
         """
         arc_train_examples: List[Example] = []
         for example in train_examples:
@@ -685,14 +611,18 @@ class ARCSolver:
         def next_seed() -> int:
             return int(rng_np.randint(0, 2**31 - 1))
 
-        # Identity task
+        task_id_counter = 0
+
+        # Original task (identity, no color permutation)
         aux_tasks.append(
             {
                 "task": base_task,
                 "undo_fn": self._identity_np,
                 "color_inverse_map": None,
+                "task_id": task_id_counter,
             }
         )
+        task_id_counter += 1
 
         basic_augmenters = get_basic_augmenters()
         NUM_COLOR_PERMUTES = 9
@@ -708,13 +638,17 @@ class ARCSolver:
                 continue
 
             undo_fn = self._get_undo_fn_for_augmenter(augmenter)
+
+            # Add geometric-only auxiliary task
             aux_tasks.append(
                 {
                     "task": geom_task,
                     "undo_fn": undo_fn,
                     "color_inverse_map": None,
+                    "task_id": task_id_counter,
                 }
             )
+            task_id_counter += 1
 
             for _ in range(NUM_COLOR_PERMUTES):
                 perm_augmenter = PermuteColors()
@@ -723,7 +657,7 @@ class ARCSolver:
                     rng=RandomState(next_seed()),
                     to_input=True,
                     to_output=True,
-                    use_test_output=False,  # Only use train outputs + test input for color map
+                    use_test_output=False,
                 )
                 if not self._task_fits_canvas(perm_task):
                     continue
@@ -734,8 +668,10 @@ class ARCSolver:
                         "task": perm_task,
                         "undo_fn": undo_fn,
                         "color_inverse_map": color_inverse,
+                        "task_id": task_id_counter,
                     }
                 )
+                task_id_counter += 1
 
         return aux_tasks
 
