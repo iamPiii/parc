@@ -1,5 +1,5 @@
 """
-ARC-AGI-2 Sandbox Runner Entry Point
+ARC-AGI-2 Sandbox Runner Entry Point (NVARC)
 
 This preserves the old CLI:
 
@@ -7,6 +7,8 @@ This preserves the old CLI:
     python arc_main.py --phase inference --input ... --output ...
 
 Under the hood it just calls the dedicated phase scripts
+
+NOTE: Uses NVARC approach with test-time training (~10-20 min per puzzle)
 """
 
 import argparse
@@ -18,7 +20,7 @@ from arc_inference_phase import run_inference_phase
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="ARC-AGI-2 Inference Script (wrapper)")
+    parser = argparse.ArgumentParser(description="ARC-AGI-2 NVARC Solver (wrapper)")
     parser.add_argument(
         "--phase",
         choices=["prep", "inference"],

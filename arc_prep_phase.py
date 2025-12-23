@@ -4,8 +4,9 @@ ARC-AGI-2 PREP PHASE SCRIPT
 This runs in the **prep container**, where internet access is allowed
 
 - Download EVERYTHING you will need later in the inference phase:
-    * VARC model weights (Hugging Face).
-    * Any auxiliary data, vocab files, tokenizers...
+    * Hwen model weights (iamPi/Hwen from Hugging Face).
+    * Tokenizer and config files.
+    * Any auxiliary data needed for NVARC approach.
 
 You ARE allowed to:
 - Change which models are downloaded
@@ -26,12 +27,7 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# VARC imports
-try:
-    from arc_solver_varc import DEFAULT_VARC_REPO_ID, DEFAULT_VARC_CACHE_DIR
-except ImportError:
-    DEFAULT_VARC_REPO_ID = "VisionARC/offline_train_ViT"
-    DEFAULT_VARC_CACHE_DIR = "/app/models"
+from arc_solver_nvarc import model_name
 
 
 @retry(
@@ -44,86 +40,81 @@ def download_model_with_retry(repo_id: str, cache_dir: str, local_dir: str) -> s
     """download model with automatic retry on network failures"""
     return snapshot_download(
         repo_id=repo_id,
+        cache_dir=cache_dir,
         local_dir=local_dir,
+        local_dir_use_symlinks=False,
         resume_download=True,
         ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
     )
 
 
 def run_prep_phase(cache_dir = Path("/app/models")) -> None:
-    """Prep phase: download VARC model checkpoint"""
+    """Prep phase: download NVARC model(s)"""
     print("\n" + "=" * 60)
-    print("PREP PHASE - Downloading VARC Model Checkpoint")
+    print("PREP PHASE - Downloading NVARC Models / Assets")
     print("=" * 60)
 
-    varc_repo_id = DEFAULT_VARC_REPO_ID
-    varc_cache_dir = Path(DEFAULT_VARC_CACHE_DIR)
-    varc_local_dir = varc_cache_dir / varc_repo_id.replace("/", "--")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_dir = cache_dir / model_name.replace("/", "--")
     
-    print(f"\n[1/3] VARC checkpoint to download: {varc_repo_id}")
-    print(f"[2/3] Cache directory: {varc_cache_dir}")
-    print(f"[3/3] Target local directory: {varc_local_dir}")
+    # We use the latest checkpoint (step_5972) by default
+    checkpoint_dir = local_dir / "step_5972"
+    
+    print(f"\n[1/4] NVARC model to download: {model_name}")
+    print(f"[2/4] Using cache directory: {cache_dir}")
+    print(f"[3/4] Target local directory: {local_dir}")
+    print(f"      Using checkpoint: step_5972")
 
-    # Check if already downloaded
-    checkpoint_files = list(varc_local_dir.glob("*.pth")) + list(varc_local_dir.glob("*.pt"))
-    if varc_local_dir.exists() and checkpoint_files:
-        print(f"\n✓ VARC checkpoint already exists at {varc_local_dir}")
-        print(f"  Found checkpoint: {checkpoint_files[0].name}")
-        
-        prep_results = {
-            "phase": "prep",
-            "model": varc_repo_id,
-            "status": "success",
-            "message": f"VARC checkpoint already cached at {varc_local_dir}",
-            "cache_dir": str(varc_cache_dir),
-        }
-        
-        print("\n" + "=" * 60)
-        print("PREP PHASE COMPLETED - Status: success")
-        print("=" * 60)
-        return
+    # Check if checkpoint folder exists with model files
+    if checkpoint_dir.exists() and any(checkpoint_dir.iterdir()):
+        files_count = len(list(checkpoint_dir.glob('*')))
+        if files_count >= 5:  # Check for actual model files in checkpoint
+            print(f"\n✓ Model checkpoint found in local cache ({files_count} files in step_5972), skipping download")
+            
+            print("\n" + "=" * 60)
+            print("PREP PHASE COMPLETED - Status: success")
+            print("=" * 60)
+            return
+        else:
+            print(f"\n⚠ Partial checkpoint detected ({files_count} files), will resume...")
+    elif local_dir.exists() and any(local_dir.iterdir()):
+        folders_count = len(list(local_dir.glob('step_*')))
+        print(f"\n⚠ Found {folders_count} checkpoint folders, but step_5972 incomplete, will resume...")
 
     print("(This phase requires internet access)")
 
     try:
-        print("\n[Downloading] VARC checkpoint from Hugging Face...")
+        print("\n[4/4] Downloading NVARC model files from Hugging Face...")
         print("(Using automatic retry with exponential backoff)")
         
-        varc_cache_dir.mkdir(parents=True, exist_ok=True)
-        varc_local_dir.mkdir(parents=True, exist_ok=True)
+        local_dir.mkdir(parents=True, exist_ok=True)
 
         downloaded_path = download_model_with_retry(
-            repo_id=varc_repo_id,
-            cache_dir=str(varc_cache_dir.parent),
-            local_dir=str(varc_local_dir)
+            repo_id=model_name,
+            cache_dir=str(cache_dir),
+            local_dir=str(local_dir)
         )
 
-        # Verify checkpoint file exists
-        checkpoint_files = list(Path(downloaded_path).glob("*.pth")) + list(Path(downloaded_path).glob("*.pt"))
-        if not checkpoint_files:
-            raise FileNotFoundError(f"No checkpoint file (*.pth or *.pt) found in {downloaded_path}")
-
-        # Check which checkpoint was downloaded
-        checkpoint_best = Path(downloaded_path) / "checkpoint_best.pt"
-        checkpoint_final = Path(downloaded_path) / "checkpoint_final.pt"
-        if checkpoint_best.exists():
-            checkpoint_name = "checkpoint_best.pt"
-        elif checkpoint_final.exists():
-            checkpoint_name = "checkpoint_final.pt"
+        print(f"✓ Model files downloaded to cache: {downloaded_path}")
+        print("✓ Model download verified")
+        
+        # Verify checkpoint structure
+        checkpoint_path = Path(downloaded_path) / "step_5972"
+        if checkpoint_path.exists():
+            files_count = len(list(checkpoint_path.glob('*')))
+            print(f"✓ Files in checkpoint step_5972: {files_count}")
+            checkpoints = [f.name for f in Path(downloaded_path).glob('step_*')]
+            print(f"✓ Available checkpoints: {', '.join(sorted(checkpoints))}")
         else:
-            checkpoint_name = checkpoint_files[0].name
-
-        print(f"✓ VARC checkpoint downloaded to: {downloaded_path}")
-        print(f"✓ Checkpoint file: {checkpoint_name}")
-        files_count = len(list(Path(downloaded_path).glob('*')))
-        print(f"✓ Total files in directory: {files_count}")
+            files_count = len(list(Path(downloaded_path).glob('*')))
+            print(f"✓ Files in model directory: {files_count}")
 
         prep_results = {
             "phase": "prep",
-            "model": varc_repo_id,
+            "model": model_name,
             "status": "success",
-            "message": f"VARC checkpoint downloaded to {downloaded_path}",
-            "cache_dir": str(varc_cache_dir),
+            "message": f"NVARC model downloaded to {downloaded_path}",
+            "cache_dir": str(cache_dir),
         }
 
     except Exception as e:
@@ -133,7 +124,7 @@ def run_prep_phase(cache_dir = Path("/app/models")) -> None:
         
         prep_results = {
             "phase": "prep",
-            "model": varc_repo_id,
+            "model": model_name,
             "status": "failed",
             "message": str(e),
         }
@@ -148,7 +139,7 @@ def run_prep_phase(cache_dir = Path("/app/models")) -> None:
 
 def _cli() -> int:
     """CLI entry point for running only the prep phase."""
-    parser = argparse.ArgumentParser(description="ARC-AGI-2 Prep Phase Script")
+    parser = argparse.ArgumentParser(description="ARC-AGI-2 Prep Phase Script (NVARC)")
     parser.add_argument("--input", type=str, required=True, help="Input directory path")
     parser.add_argument("--output", type=str, required=True, help="Output directory path")
     args = parser.parse_args()

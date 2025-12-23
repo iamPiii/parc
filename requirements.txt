@@ -10,3 +10,8 @@ timm==1.0.12
 einops
 datasets
 diffusers
+transformers
+unsloth
+peft
+bitsandbytes
+accelerate
