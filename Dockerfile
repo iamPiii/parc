@@ -5,9 +5,10 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ca-certificates \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /app/models && chmod 777 /app/models
+RUN mkdir -p /app/models /app/cache && chmod 777 /app/models /app/cache
 
 ENV HF_HOME=/app/models \
     TRANSFORMERS_CACHE=/app/models \
