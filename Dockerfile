@@ -12,6 +12,7 @@ RUN mkdir -p /app/models && chmod 777 /app/models
 ENV HF_HOME=/app/models \
     TRANSFORMERS_CACHE=/app/models \
     HF_DATASETS_CACHE=/app/models \
+    TRITON_CACHE_DIR=/app/models/.triton \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
