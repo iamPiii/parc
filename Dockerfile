@@ -1,19 +1,34 @@
-FROM python:3.11-slim
+# Use NVIDIA CUDA base image for GPU support
+FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
+# Install Python 3.11 and build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
     curl \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    build-essential \
+    git \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python
 
 RUN mkdir -p /app/models && chmod 777 /app/models
 
+# Environment variables for HuggingFace and CUDA
 ENV HF_HOME=/app/models \
     TRANSFORMERS_CACHE=/app/models \
     HF_DATASETS_CACHE=/app/models \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    CUDA_HOME=/usr/local/cuda \
+    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \

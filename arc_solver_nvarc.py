@@ -565,6 +565,26 @@ class ARCSolver:
             inference_timeout: Timeout for inference in seconds
             beam_threshold: Probability threshold for beam search
         """
+        # GPU detection and diagnostics
+        print("\n" + "=" * 50)
+        print("NVARC Solver - GPU Detection")
+        print("=" * 50)
+        print(f"PyTorch version: {torch.__version__}")
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        if torch.cuda.is_available():
+            print(f"CUDA version: {torch.version.cuda}")
+            print(f"cuDNN version: {torch.backends.cudnn.version()}")
+            print(f"GPU count: {torch.cuda.device_count()}")
+            for i in range(torch.cuda.device_count()):
+                print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+                print(f"    Memory: {torch.cuda.get_device_properties(i).total_memory / 1024**3:.1f} GB")
+        else:
+            print("WARNING: CUDA not available! Training will be slow on CPU.")
+            import os
+            print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}")
+            print(f"  NVIDIA_VISIBLE_DEVICES: {os.environ.get('NVIDIA_VISIBLE_DEVICES', 'not set')}")
+        print("=" * 50 + "\n")
+
         # Import unsloth here to avoid import errors if not installed
         try:
             from unsloth import FastLanguageModel, UnslothTrainingArguments, UnslothTrainer
@@ -577,6 +597,8 @@ class ARCSolver:
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_seq_length = max_seq_length
+
+        print(f"Using device: {self.device}")
 
         # TTT hyperparameters
         self.ttt_augment_n = ttt_augment_n
@@ -653,6 +675,15 @@ class ARCSolver:
 
         # Load model
         print(f"Loading NVARC model from {model_path}...")
+
+        # Determine device_map based on CUDA availability
+        if torch.cuda.is_available():
+            device_map = "cuda:0"
+            print(f"Loading model to GPU (device_map={device_map})")
+        else:
+            device_map = "cpu"
+            print(f"WARNING: Loading model to CPU - this will be slow!")
+
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_path,
             full_finetuning=False,
@@ -660,6 +691,7 @@ class ARCSolver:
             local_files_only=(checkpoint_path is not None),
             use_gradient_checkpointing=False,
             max_seq_length=max_seq_length,
+            device_map=device_map,
         )
 
         # Apply PEFT
