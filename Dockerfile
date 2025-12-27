@@ -1,5 +1,5 @@
 # Use NVIDIA CUDA base image for GPU support
-FROM nvidia/cuda:12.8.0-cudnn-runtime-ubuntu22.04
+FROM nvidia/cuda:12.6.0-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
@@ -35,5 +35,6 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY . .
+
 
 CMD ["python3", "arc_main.py"]
