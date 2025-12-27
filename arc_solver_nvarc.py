@@ -366,30 +366,24 @@ class UnslothFixedTrainer:
         class FixedTrainer(UnslothTrainer_class):
             def training_step(self, model, inputs, num_items_in_batch=None):
                 """Override training_step to add detailed logging."""
-                print(f"[DEBUG TRAINER] training_step called")
-                print(f"[DEBUG TRAINER]   - Input keys: {list(inputs.keys())}")
+                print(f"[DEBUG TRAINER] training_step called", flush=True)
+                print(f"[DEBUG TRAINER]   - Input keys: {list(inputs.keys())}", flush=True)
                 for k, v in inputs.items():
                     if hasattr(v, 'shape'):
-                        print(f"[DEBUG TRAINER]   - {k} shape: {v.shape}, dtype: {v.dtype}, device: {v.device}")
-                sys.stdout.flush()
+                        print(f"[DEBUG TRAINER]   - {k} shape: {v.shape}, dtype: {v.dtype}, device: {v.device}", flush=True)
 
-                print("[DEBUG TRAINER]   - Calling model.train()...")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER]   - Calling model.train()...", flush=True)
                 model.train()
 
-                print("[DEBUG TRAINER]   - Moving inputs to device...")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER]   - Moving inputs to device...", flush=True)
                 inputs = self._prepare_inputs(inputs)
 
-                print("[DEBUG TRAINER]   - Entering autocast context...")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER]   - Entering autocast context...", flush=True)
                 with self.compute_loss_context_manager():
-                    print("[DEBUG TRAINER]   - Computing loss...")
-                    sys.stdout.flush()
+                    print("[DEBUG TRAINER]   - Computing loss...", flush=True)
                     loss = self.compute_loss(model, inputs)
 
-                print(f"[DEBUG TRAINER]   - Loss computed: {loss.item() if hasattr(loss, 'item') else loss}")
-                sys.stdout.flush()
+                print(f"[DEBUG TRAINER]   - Loss computed: {loss.item() if hasattr(loss, 'item') else loss}", flush=True)
 
                 # Handle gradient accumulation
                 del inputs
@@ -399,29 +393,24 @@ class UnslothFixedTrainer:
                 ):
                     loss = loss / self.args.gradient_accumulation_steps
 
-                print("[DEBUG TRAINER]   - Calling accelerator.backward()...")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER]   - Calling accelerator.backward()...", flush=True)
                 self.accelerator.backward(loss)
-                print("[DEBUG TRAINER]   - Backward pass completed")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER]   - Backward pass completed", flush=True)
 
                 return loss.detach()
 
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 """Fixed compute_loss that handles Unsloth's view tensor issue"""
-                print("[DEBUG TRAINER] compute_loss called")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER] compute_loss called", flush=True)
 
                 if self.label_smoother is not None and "labels" in inputs:
                     labels = inputs.pop("labels")
                 else:
                     labels = None
 
-                print("[DEBUG TRAINER]   - Running model forward pass...")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER]   - Running model forward pass...", flush=True)
                 outputs = model(**inputs)
-                print("[DEBUG TRAINER]   - Model forward pass completed")
-                sys.stdout.flush()
+                print("[DEBUG TRAINER]   - Model forward pass completed", flush=True)
 
                 if labels is not None:
                     unwrapped_model = self.accelerator.unwrap_model(model)
@@ -432,8 +421,7 @@ class UnslothFixedTrainer:
                 else:
                     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
-                print(f"[DEBUG TRAINER]   - Raw loss: {loss.item() if hasattr(loss, 'item') else loss}")
-                sys.stdout.flush()
+                print(f"[DEBUG TRAINER]   - Raw loss: {loss.item() if hasattr(loss, 'item') else loss}", flush=True)
 
                 # KEY FIX: Clone the loss tensor before in-place operations
                 if hasattr(loss, "clone"):
