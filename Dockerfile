@@ -23,6 +23,9 @@ RUN mkdir -p /app/models && chmod 777 /app/models
 ENV HF_HOME=/app/models \
     TRANSFORMERS_CACHE=/app/models \
     HF_DATASETS_CACHE=/app/models \
+    TRITON_CACHE_DIR=/tmp/.triton \
+    TORCH_HOME=/tmp/.cache/torch \
+    XDG_CACHE_HOME=/tmp/.cache \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     NVIDIA_VISIBLE_DEVICES=all \
@@ -31,7 +34,10 @@ ENV HF_HOME=/app/models \
     TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
 
 COPY requirements.txt .
+
+# Install PyTorch with CUDA support FIRST (before requirements.txt)
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir torch==2.7.0+cu126 --index-url https://download.pytorch.org/whl/cu126 && \
     pip install --no-cache-dir -r requirements.txt
 
 COPY . .
