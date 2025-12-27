@@ -364,13 +364,65 @@ class UnslothFixedTrainer:
         """Create a fixed trainer that handles Unsloth's view tensor issue."""
 
         class FixedTrainer(UnslothTrainer_class):
+            def training_step(self, model, inputs, num_items_in_batch=None):
+                """Override training_step to add detailed logging."""
+                print(f"[DEBUG TRAINER] training_step called")
+                print(f"[DEBUG TRAINER]   - Input keys: {list(inputs.keys())}")
+                for k, v in inputs.items():
+                    if hasattr(v, 'shape'):
+                        print(f"[DEBUG TRAINER]   - {k} shape: {v.shape}, dtype: {v.dtype}, device: {v.device}")
+                sys.stdout.flush()
+
+                print("[DEBUG TRAINER]   - Calling model.train()...")
+                sys.stdout.flush()
+                model.train()
+
+                print("[DEBUG TRAINER]   - Moving inputs to device...")
+                sys.stdout.flush()
+                inputs = self._prepare_inputs(inputs)
+
+                print("[DEBUG TRAINER]   - Entering autocast context...")
+                sys.stdout.flush()
+                with self.compute_loss_context_manager():
+                    print("[DEBUG TRAINER]   - Computing loss...")
+                    sys.stdout.flush()
+                    loss = self.compute_loss(model, inputs)
+
+                print(f"[DEBUG TRAINER]   - Loss computed: {loss.item() if hasattr(loss, 'item') else loss}")
+                sys.stdout.flush()
+
+                # Handle gradient accumulation
+                del inputs
+                if (
+                    self.args.n_gpu > 1
+                    or self.accelerator.num_processes > 1
+                ):
+                    loss = loss / self.args.gradient_accumulation_steps
+
+                print("[DEBUG TRAINER]   - Calling accelerator.backward()...")
+                sys.stdout.flush()
+                self.accelerator.backward(loss)
+                print("[DEBUG TRAINER]   - Backward pass completed")
+                sys.stdout.flush()
+
+                return loss.detach()
+
             def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
                 """Fixed compute_loss that handles Unsloth's view tensor issue"""
+                print("[DEBUG TRAINER] compute_loss called")
+                sys.stdout.flush()
+
                 if self.label_smoother is not None and "labels" in inputs:
                     labels = inputs.pop("labels")
                 else:
                     labels = None
+
+                print("[DEBUG TRAINER]   - Running model forward pass...")
+                sys.stdout.flush()
                 outputs = model(**inputs)
+                print("[DEBUG TRAINER]   - Model forward pass completed")
+                sys.stdout.flush()
+
                 if labels is not None:
                     unwrapped_model = self.accelerator.unwrap_model(model)
                     if hasattr(unwrapped_model, "_get_name") and "unsloth" in unwrapped_model._get_name().lower():
@@ -379,6 +431,10 @@ class UnslothFixedTrainer:
                         loss = self.label_smoother(outputs, labels)
                 else:
                     loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+                print(f"[DEBUG TRAINER]   - Raw loss: {loss.item() if hasattr(loss, 'item') else loss}")
+                sys.stdout.flush()
+
                 # KEY FIX: Clone the loss tensor before in-place operations
                 if hasattr(loss, "clone"):
                     loss = loss.clone()  # Converts view tensor to independent tensor
@@ -923,8 +979,45 @@ class ARCSolver:
             print(f"[DEBUG TTT] GPU Memory before training: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
             sys.stdout.flush()
 
-        print("[DEBUG TTT] Starting trainer.train()...")
+        # Add debug callback to track training progress
+        from transformers import TrainerCallback
+        import signal
+        import faulthandler
+
+        # Enable faulthandler to get Python traceback on segfault
+        faulthandler.enable()
+
+        class DebugCallback(TrainerCallback):
+            def on_train_begin(self, args, state, control, **kwargs):
+                print("[DEBUG CALLBACK] on_train_begin called")
+                sys.stdout.flush()
+
+            def on_step_begin(self, args, state, control, **kwargs):
+                print(f"[DEBUG CALLBACK] on_step_begin: step {state.global_step}")
+                sys.stdout.flush()
+
+            def on_step_end(self, args, state, control, **kwargs):
+                print(f"[DEBUG CALLBACK] on_step_end: step {state.global_step}, loss={state.log_history[-1].get('loss', 'N/A') if state.log_history else 'N/A'}")
+                sys.stdout.flush()
+
+            def on_log(self, args, state, control, logs=None, **kwargs):
+                print(f"[DEBUG CALLBACK] on_log: {logs}")
+                sys.stdout.flush()
+
+        trainer.add_callback(DebugCallback())
+        print("[DEBUG TTT] Debug callback added")
         sys.stdout.flush()
+
+        print("[DEBUG TTT] Starting trainer.train()...")
+        print("[DEBUG TTT] Trainer config:")
+        print(f"  - Model type: {type(self.model)}")
+        print(f"  - Dataset size: {len(hf_dataset)}")
+        print(f"  - Batch size: {training_args.per_device_train_batch_size}")
+        print(f"  - Gradient accumulation: {training_args.gradient_accumulation_steps}")
+        print(f"  - bf16: {training_args.bf16}")
+        print(f"  - fp16: {training_args.fp16}")
+        sys.stdout.flush()
+
         trainer.train()
         print("[DEBUG TTT] Training completed successfully")
         sys.stdout.flush()
