@@ -23,9 +23,9 @@ RUN mkdir -p /app/models && chmod 777 /app/models
 ENV HF_HOME=/app/models \
     TRANSFORMERS_CACHE=/app/models \
     HF_DATASETS_CACHE=/app/models \
-    TRITON_CACHE_DIR=/tmp/.triton \
-    TORCH_HOME=/tmp/.cache/torch \
-    XDG_CACHE_HOME=/tmp/.cache \
+    TRITON_CACHE_DIR=/app/models/.triton \
+    TORCH_HOME=/app/models/.cache/torch \
+    XDG_CACHE_HOME=/app/models/.cache \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     NVIDIA_VISIBLE_DEVICES=all \
