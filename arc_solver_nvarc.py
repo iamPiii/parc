@@ -344,6 +344,44 @@ class NVARCDataset:
 
 
 # ============================================================================
+# Fixed Unsloth Trainer (from NVARC reference)
+# ============================================================================
+
+class UnslothFixedTrainer:
+    """Wrapper to handle Unsloth trainer import and initialization."""
+
+    @staticmethod
+    def create_trainer(UnslothTrainer_class, **kwargs):
+        """Create a fixed trainer that handles Unsloth's view tensor issue."""
+
+        class FixedTrainer(UnslothTrainer_class):
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                """Fixed compute_loss that handles Unsloth's view tensor issue"""
+                if self.label_smoother is not None and "labels" in inputs:
+                    labels = inputs.pop("labels")
+                else:
+                    labels = None
+                outputs = model(**inputs)
+                if labels is not None:
+                    unwrapped_model = self.accelerator.unwrap_model(model)
+                    if hasattr(unwrapped_model, "_get_name") and "unsloth" in unwrapped_model._get_name().lower():
+                        loss = self.label_smoother(outputs, labels, shift_labels=True)
+                    else:
+                        loss = self.label_smoother(outputs, labels)
+                else:
+                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+                # KEY FIX: Clone the loss tensor before in-place operations
+                if hasattr(loss, "clone"):
+                    loss = loss.clone()  # Converts view tensor to independent tensor
+                # Now safe for DDP gradient scaling
+                if self.accelerator.num_processes > 1:
+                    loss = loss * self.accelerator.num_processes
+                return (loss, outputs) if return_outputs else loss
+
+        return FixedTrainer(**kwargs)
+
+
+# ============================================================================
 # Data Collator for Completion-Only LM
 # ============================================================================
 
@@ -835,9 +873,10 @@ class ARCSolver:
         train_list = train_ds.as_list(self.formatter)
         print(f"[DEBUG TTT] Training dataset size: {len(train_list)} examples")
 
-        print("[DEBUG TTT] Creating Unsloth trainer...")
+        print("[DEBUG TTT] Creating Unsloth trainer (using fixed trainer)...")
         with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
-            trainer = self._UnslothTrainer(
+            trainer = UnslothFixedTrainer.create_trainer(
+                self._UnslothTrainer,
                 model=self.model,
                 tokenizer=self.tokenizer,
                 data_collator=self.collator,
@@ -846,7 +885,7 @@ class ARCSolver:
                 max_seq_length=self.max_seq_length,
                 args=self._UnslothTrainingArguments(**self.train_args),
             )
-            print("[DEBUG TTT] Trainer created successfully")
+            print("[DEBUG TTT] Fixed trainer created successfully")
 
             # Check GPU memory before training
             if torch.cuda.is_available():
