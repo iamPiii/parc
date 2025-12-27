@@ -20,11 +20,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 from contextlib import redirect_stdout, redirect_stderr
 
-# Set Triton cache directory to a writable location before importing torch
-# This prevents "Read-only file system" errors in containerized environments
-if "TRITON_CACHE_DIR" not in os.environ:
-    os.environ["TRITON_CACHE_DIR"] = os.environ.get("TMPDIR", "/tmp") + "/.triton"
-
 import numpy as np
 import torch
 from datasets import Dataset
@@ -654,6 +649,7 @@ class ARCSolver:
 
         # Training arguments
         self.train_args = dict(
+            output_dir="/app/models/.trainer_tmp",
             per_device_eval_batch_size=1,
             per_device_train_batch_size=1,
             gradient_accumulation_steps=1,
