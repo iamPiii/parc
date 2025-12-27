@@ -873,35 +873,56 @@ class ARCSolver:
         train_list = train_ds.as_list(self.formatter)
         print(f"[DEBUG TTT] Training dataset size: {len(train_list)} examples")
 
-        print("[DEBUG TTT] Creating Unsloth trainer (using fixed trainer)...")
-        with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
-            trainer = UnslothFixedTrainer.create_trainer(
-                self._UnslothTrainer,
-                model=self.model,
-                tokenizer=self.tokenizer,
-                data_collator=self.collator,
-                train_dataset=Dataset.from_list(train_list),
-                dataset_text_field="text",
-                max_seq_length=self.max_seq_length,
-                args=self._UnslothTrainingArguments(**self.train_args),
-            )
-            print("[DEBUG TTT] Fixed trainer created successfully")
+        print("[DEBUG TTT] Creating training arguments...")
+        import sys
+        sys.stdout.flush()
+        sys.stderr.flush()
 
-            # Check GPU memory before training
-            if torch.cuda.is_available():
-                print(f"[DEBUG TTT] GPU Memory before training: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
+        training_args = self._UnslothTrainingArguments(**self.train_args)
+        print(f"[DEBUG TTT] Training args created: output_dir={training_args.output_dir}")
+        sys.stdout.flush()
 
-            print("[DEBUG TTT] Starting trainer.train()...")
-            trainer.train()
-            print("[DEBUG TTT] Training completed successfully")
+        print("[DEBUG TTT] Creating HuggingFace dataset...")
+        sys.stdout.flush()
+        hf_dataset = Dataset.from_list(train_list)
+        print(f"[DEBUG TTT] HF Dataset created: {len(hf_dataset)} examples")
+        sys.stdout.flush()
 
-            print("[DEBUG TTT] Unwrapping model...")
-            self.model = trainer.accelerator.unwrap_model(self.model, keep_fp32_wrapper=False)
-            print("[DEBUG TTT] Model unwrapped")
+        print("[DEBUG TTT] Initializing UnslothTrainer (this may take a moment)...")
+        sys.stdout.flush()
 
-            print("[DEBUG TTT] Deleting trainer...")
-            del trainer
-            print("[DEBUG TTT] Trainer deleted")
+        # Don't suppress output so we can see errors
+        trainer = UnslothFixedTrainer.create_trainer(
+            self._UnslothTrainer,
+            model=self.model,
+            tokenizer=self.tokenizer,
+            data_collator=self.collator,
+            train_dataset=hf_dataset,
+            dataset_text_field="text",
+            max_seq_length=self.max_seq_length,
+            args=training_args,
+        )
+        print("[DEBUG TTT] Trainer created successfully")
+        sys.stdout.flush()
+
+        # Check GPU memory before training
+        if torch.cuda.is_available():
+            print(f"[DEBUG TTT] GPU Memory before training: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
+            sys.stdout.flush()
+
+        print("[DEBUG TTT] Starting trainer.train()...")
+        sys.stdout.flush()
+        trainer.train()
+        print("[DEBUG TTT] Training completed successfully")
+        sys.stdout.flush()
+
+        print("[DEBUG TTT] Unwrapping model...")
+        self.model = trainer.accelerator.unwrap_model(self.model, keep_fp32_wrapper=False)
+        print("[DEBUG TTT] Model unwrapped")
+
+        print("[DEBUG TTT] Deleting trainer...")
+        del trainer
+        print("[DEBUG TTT] Trainer deleted")
 
     def _run_inference(self, puzzle_ds: NVARCDataset, start_time: float) -> List[np.ndarray]:
         """Run inference with augmentation and decoding."""
