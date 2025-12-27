@@ -716,6 +716,12 @@ class ARCSolver:
             mlm=False,
         )
 
+        # Print GPU memory stats
+        if torch.cuda.is_available():
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB total")
+            print(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
+            print(f"GPU Memory Cached: {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB")
+
         print(f"NVARC ARCSolver initialized on {self.device}")
 
     def solve(
@@ -734,6 +740,7 @@ class ARCSolver:
             Predicted output grid (2D list of ints in [0, 9])
         """
         start_time = time.time()
+        print(f"[DEBUG] Starting solve() - {len(train_examples)} training examples, test input shape: {len(test_input)}x{len(test_input[0])}")
 
         # Create a unique key for this task (no underscores to avoid issues with split_multi_replies)
         task_key = "puzzle"
@@ -748,6 +755,7 @@ class ARCSolver:
         replies = {}  # No replies for test
 
         puzzle_ds = NVARCDataset(queries=queries, replies=replies, keys=[task_key])
+        print("[DEBUG] Dataset created")
 
         # Reset model weights
         self._set_peft_model_state_dict(
@@ -755,19 +763,25 @@ class ARCSolver:
             deepcopy(self.default_weights),
             adapter_name="default",
         )
+        print("[DEBUG] Model weights reset")
 
         # Test-time training
         if self.enable_ttt and train_examples:
+            print("[DEBUG] Starting test-time training...")
             self._test_time_train(puzzle_ds)
+            print("[DEBUG] Test-time training completed")
 
         # Set model to inference mode
+        print("[DEBUG] Setting model to inference mode...")
         self.model = self._FastLanguageModel.for_inference(self.model)
 
         gc.collect()
         torch.cuda.empty_cache()
+        print("[DEBUG] Memory cleared, starting inference...")
 
         # Run inference
         predictions = self._run_inference(puzzle_ds, start_time)
+        print(f"[DEBUG] Inference completed, got {len(predictions)} predictions")
 
         if not predictions:
             # Fallback: return the test input
