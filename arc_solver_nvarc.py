@@ -297,6 +297,12 @@ class NVARCDataset:
             reply = temp_ds.replies.get(key)
             while max_len < temp_ds.get_length(key, formatter=formatter, name=name):
                 query = temp_ds.queries[key]
+
+                # Safety check: keep at least one training example
+                if len(query.get('train', [])) <= 1:
+                    print(f"[WARNING] Cannot cut further - only {len(query.get('train', []))} training example(s) left for key {key}")
+                    break
+
                 if not key.split('.')[-1].startswith('ex'):
                     key = f"{key}.ex{''.join(map(str, range(len(query['train']))))}"
                 key_split = key.split('.')
