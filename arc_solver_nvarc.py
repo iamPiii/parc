@@ -798,34 +798,65 @@ class ARCSolver:
 
     def _test_time_train(self, puzzle_ds: NVARCDataset) -> None:
         """Perform test-time training on the training examples."""
+        print("[DEBUG TTT] Setting model to training mode...")
         # Set model to training mode
         self.model = self._FastLanguageModel.for_training(self.model)
+        print("[DEBUG TTT] Model set to training mode")
+
+        # Check GPU memory before augmentation
+        if torch.cuda.is_available():
+            print(f"[DEBUG TTT] GPU Memory before augmentation: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
 
         # Augment training data
+        print(f"[DEBUG TTT] Starting data augmentation (n={self.ttt_augment_n})...")
         train_ds = puzzle_ds.augment(n=self.ttt_augment_n, shfl_keys=True, seed=1)
+        print(f"[DEBUG TTT] Augmentation complete, dataset has {len(train_ds.keys)} keys")
+
+        print(f"[DEBUG TTT] Cutting to max length {self.max_seq_length}...")
         train_ds = train_ds.cut_to_len(
             formatter=self.formatter,
             name="text",
             max_len=self.max_seq_length
         )
+        print(f"[DEBUG TTT] After cutting, dataset has {len(train_ds.keys)} keys")
+
+        # Check GPU memory after augmentation
+        if torch.cuda.is_available():
+            print(f"[DEBUG TTT] GPU Memory after augmentation: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
 
         # Create trainer
+        print("[DEBUG TTT] Converting dataset to list...")
+        train_list = train_ds.as_list(self.formatter)
+        print(f"[DEBUG TTT] Training dataset size: {len(train_list)} examples")
+
+        print("[DEBUG TTT] Creating Unsloth trainer...")
         with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
             trainer = self._UnslothTrainer(
                 model=self.model,
                 tokenizer=self.tokenizer,
                 data_collator=self.collator,
-                train_dataset=Dataset.from_list(train_ds.as_list(self.formatter)),
+                train_dataset=Dataset.from_list(train_list),
                 dataset_text_field="text",
                 max_seq_length=self.max_seq_length,
                 args=self._UnslothTrainingArguments(**self.train_args),
             )
+            print("[DEBUG TTT] Trainer created successfully")
 
+            # Check GPU memory before training
+            if torch.cuda.is_available():
+                print(f"[DEBUG TTT] GPU Memory before training: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
+
+            print("[DEBUG TTT] Starting trainer.train()...")
             trainer.train()
+            print("[DEBUG TTT] Training completed successfully")
 
+            print("[DEBUG TTT] Unwrapping model...")
             self.model = trainer.accelerator.unwrap_model(self.model, keep_fp32_wrapper=False)
+            print("[DEBUG TTT] Model unwrapped")
 
+            print("[DEBUG TTT] Deleting trainer...")
             del trainer
+            print("[DEBUG TTT] Trainer deleted")
 
     def _run_inference(self, puzzle_ds: NVARCDataset, start_time: float) -> List[np.ndarray]:
         """Run inference with augmentation and decoding."""
