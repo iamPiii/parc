@@ -20,8 +20,17 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 from contextlib import redirect_stdout, redirect_stderr
 
+# Disable PyTorch Inductor/Dynamo JIT compilation to prevent segfaults
+# This must be set BEFORE importing torch
+# See: https://github.com/unslothai/unsloth/issues/668
+os.environ['TORCH_COMPILE'] = '0'
+os.environ['TORCHINDUCTOR_DISABLE'] = '1'
+
 import numpy as np
 import torch
+
+# Also disable dynamo after torch import
+torch._dynamo.config.disable = True
 from datasets import Dataset
 from transformers import DataCollatorForLanguageModeling, AutoTokenizer
 
@@ -386,16 +395,20 @@ class UnslothFixedTrainer:
 # ============================================================================
 
 class QwenDataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
-    """Data collator that only computes loss on assistant completions."""
+    """Data collator that only computes loss on assistant completions.
+
+    Matches original NVARC implementation exactly.
+    """
 
     def torch_call(self, examples: list) -> dict:
         batch = super().torch_call(examples)
         for i in range(len(examples)):
             labels = batch["input_ids"][i].clone()
-            user_start_idx = np.where(labels.cpu().numpy() == USER_TOKEN_ID)[0].tolist()
-            assistant_start_idx = np.where(labels.cpu().numpy() == ASSISTANT_TOKEN_ID)[0].tolist()
+            # Match original NVARC: use numpy directly on tensor
+            user_start_idx = np.where(labels == USER_TOKEN_ID)[0].tolist()
+            assistant_start_idx = np.where(labels == ASSISTANT_TOKEN_ID)[0].tolist()
             start_idx = sorted(user_start_idx + assistant_start_idx)
-            end_idx = np.where(labels.cpu().numpy() == EOS_ID)[0]
+            end_idx = np.where(labels == EOS_ID)[0]
             batch["labels"][i, :] = -100
             for j, (start, end) in enumerate(zip(start_idx, end_idx)):
                 assert start < end

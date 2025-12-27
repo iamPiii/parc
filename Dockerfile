@@ -31,7 +31,9 @@ ENV HF_HOME=/app/models \
     NVIDIA_VISIBLE_DEVICES=all \
     NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     CUDA_HOME=/usr/local/cuda \
-    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0"
+    TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9;9.0" \
+    TORCH_COMPILE=0 \
+    TORCHINDUCTOR_DISABLE=1
 
 COPY requirements.txt .
 
