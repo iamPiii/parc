@@ -636,7 +636,7 @@ class ARCSolver:
 
         # PEFT parameters
         self.peft_params = dict(
-            r=256,
+            r=64,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"],
             lora_alpha=32,
             lora_dropout=0.0,
