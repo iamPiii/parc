@@ -536,10 +536,10 @@ class ARCSolver:
         checkpoint_path: Optional[str] = None,
         repo_id: Optional[str] = None,
         cache_dir: Optional[str] = None,
-        max_seq_length: int = 8192,
+        max_seq_length: int = 512,
         device: Optional[str] = None,
         # TTT hyperparameters
-        ttt_augment_n: int = 16,
+        ttt_augment_n: int = 4,
         ttt_learning_rate: float = 5e-5,
         ttt_epochs: int = 1,
         enable_ttt: bool = True,
@@ -636,7 +636,7 @@ class ARCSolver:
 
         # PEFT parameters
         self.peft_params = dict(
-            r=64,
+            r=32,
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"],
             lora_alpha=32,
             lora_dropout=0.0,
