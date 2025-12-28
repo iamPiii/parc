@@ -65,21 +65,32 @@ DEFAULT_NVARC_CACHE_DIR = os.environ.get("NVARC_CACHE_DIR", "/app/models")
 
 
 # ============================================================================
-# Token/Vocabulary Constants
+# Token/Vocabulary Constants - HARDCODED for 16-token ARC vocabulary
 # ============================================================================
+# Exact vocabulary from tokenizer:
+# {"0":0,"1":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,
+#  "Ċ":10,"user":11,"assistant":12,"<|endoftext|>":13,"<|im_start|>":14,"<|im_end|>":15}
 
 ARC_VOCAB = {
-    "0": 0, "1": 1, "2": 2, "3": 3, "4": 4,
-    "5": 5, "6": 6, "7": 7, "8": 8, "9": 9,
+    "0": 0,
+    "1": 1,
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7,
+    "8": 8,
+    "9": 9,
     "Ċ": 10,  # newline
-    "<|im_end|>": 15,
+    "<|im_end|>": 15,  # EOS for generation
 }
 
-ARC_TOKENS = list(ARC_VOCAB.values())
-USER_TOKEN_ID = 11
-ASSISTANT_TOKEN_ID = 12
-PAD_ID = 13
-EOS_ID = 15
+ARC_TOKENS = list(ARC_VOCAB.values())  # [0,1,2,3,4,5,6,7,8,9,10,15]
+USER_TOKEN_ID = 11       # "user"
+ASSISTANT_TOKEN_ID = 12  # "assistant"
+PAD_ID = 13              # <|endoftext|>
+EOS_ID = 15              # <|im_end|>
 
 
 # ============================================================================
@@ -409,15 +420,62 @@ class QwenDataCollatorForCompletionOnlyLM(DataCollatorForLanguageModeling):
 # Beam Search DFS Inference
 # ============================================================================
 
+_turbo_dfs_debug_printed = False  # Only print debug once
+
 def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, start_time, end_time) -> dict:
     """Depth-first beam search for generation.
 
     EXACTLY matches original NVARC implementation.
     Uses TWO timeout conditions: 540 seconds from start AND absolute end_time.
     """
+    global _turbo_dfs_debug_printed
+
     n = logits.size(0)
 
     nll = torch.tensor(scores, dtype=torch.float32).view(n, 1) - logits.float().cpu().log_softmax(-1)
+
+    # Debug: print info about ARC_TOKENS and scores on first call
+    if not _turbo_dfs_debug_printed:
+        _turbo_dfs_debug_printed = True
+        print(f"\n{'='*60}")
+        print(f"[DEBUG turbo_dfs] First call debug info:")
+        print(f"{'='*60}")
+        print(f"  ARC_TOKENS = {ARC_TOKENS}")
+        print(f"  EOS_ID = {EOS_ID}, PAD_ID = {PAD_ID}")
+        print(f"  max_score = {max_score:.4f} (threshold, prob > {np.exp(-max_score):.2%})")
+        print(f"  logits shape = {logits.shape} (batch_size, vocab_size)")
+        print(f"  vocab_size from logits = {logits.shape[-1]}")
+
+        # Check if vocab size matches expectation
+        vocab_size = logits.shape[-1]
+        if vocab_size != 16:
+            print(f"  *** WARNING: Expected vocab_size=16, got {vocab_size}! ***")
+            print(f"  *** This suggests model has wrong vocabulary! ***")
+
+        # Show scores for each ARC token
+        log_softmax = logits.float().cpu().log_softmax(-1)
+        print(f"\n  Scores for ALL ARC_TOKENS (batch 0):")
+        passing_count = 0
+        for t in ARC_TOKENS:
+            if t < nll.size(1):
+                score = nll[0, t].item()
+                prob = torch.exp(log_softmax[0, t]).item()
+                passes = score < max_score
+                if passes:
+                    passing_count += 1
+                print(f"    Token {t:2d}: nll={score:8.4f}, prob={prob:.4f}, passes={passes}")
+            else:
+                print(f"    Token {t:2d}: OUT OF VOCAB RANGE!")
+        print(f"  Total passing ARC tokens: {passing_count}/{len(ARC_TOKENS)}")
+
+        # Show top 10 tokens by probability (to see what model actually predicts)
+        probs = torch.exp(log_softmax[0])
+        top_probs, top_indices = torch.topk(probs, min(10, vocab_size))
+        print(f"\n  Top {len(top_probs)} tokens by probability (batch 0):")
+        for i, (prob, idx) in enumerate(zip(top_probs, top_indices)):
+            is_arc = idx.item() in ARC_TOKENS
+            print(f"    {i+1}. Token {idx.item():3d}: prob={prob.item():.4f} {'(ARC)' if is_arc else ''}")
+        print(f"{'='*60}\n")
 
     suffixes = defaultdict(list)
 
@@ -495,6 +553,10 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, end_tim
     """
     # Match original NVARC exactly: convert directly to tensor
     input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
+
+    # Debug: print input shape
+    print(f"  [inference_turbo_dfs] input_ids shape: {input_ids.shape}")
+
     outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
     suffixes = turbo_dfs(
         model,
@@ -508,9 +570,15 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, end_tim
         end_time=end_time,
     )
     result = []
+    total_beams = 0
     for batch_id, beams in suffixes.items():
         sorted_beams = sorted(beams, key=lambda x: x[0])
         result.append((batch_id, sorted_beams))
+        total_beams += len(sorted_beams)
+
+    # Debug: print beam counts
+    print(f"  [inference_turbo_dfs] Returned {len(result)} batch results, {total_beams} total beams")
+
     return result
 
 
@@ -678,6 +746,10 @@ class ARCSolver:
             local_files_only=(checkpoint_path is not None),
             trust_remote_code=True,
         )
+
+        # Verify tokenizer matches expected 16-token ARC vocabulary
+        print(f"Tokenizer vocab size: {len(self.tokenizer)}")
+        print(f"Expected ARC_TOKENS: {ARC_TOKENS}")
 
         # Set model to eval mode for inference - NO PEFT adapter applied
         self.model.eval()
