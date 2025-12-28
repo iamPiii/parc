@@ -491,7 +491,7 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
     print(f"[DEBUG DFS] Starting inference_turbo_dfs with {len(prefix_tokens)} sequences", flush=True)
     sys.stdout.flush()
 
-    # Pad sequences to same length (like calc_scores in original NVARC)
+    # Pad sequences to same length
     batch_lengths = [len(tokens) for tokens in prefix_tokens]
     max_len = max(batch_lengths)
     padded_tokens = []
@@ -499,6 +499,11 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
         padded = tokens + [PAD_ID] * (max_len - len(tokens))
         padded_tokens.append(padded)
     input_ids = torch.tensor(padded_tokens, device=model.device, dtype=torch.long)
+
+    # Create attention mask to ignore padding
+    attention_mask = torch.zeros_like(input_ids)
+    for i, length in enumerate(batch_lengths):
+        attention_mask[i, :length] = 1
 
     print(f"[DEBUG DFS] Running model forward pass (first call may take 60-120s for compilation)...", flush=True)
     sys.stdout.flush()
@@ -525,7 +530,7 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
     heartbeat_thread.start()
 
     try:
-        outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, use_cache=True)
 
         # Stop heartbeat
         heartbeat_active.clear()
@@ -549,13 +554,20 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
 
     print(f"[DEBUG DFS] Starting turbo_dfs recursion...", flush=True)
     sys.stdout.flush()
+
+    # Extract logits at actual last positions (not padded positions)
+    last_logits = []
+    for i, length in enumerate(batch_lengths):
+        last_logits.append(outputs.logits[i, length - 1])
+    last_logits = torch.stack(last_logits)
+
     suffixes = turbo_dfs(
         model,
-        logits=outputs.logits[:, -1],
+        logits=last_logits,
         max_new_tokens=max_new_tokens,
         max_score=max_score,
         scores=[0.0] * input_ids.size(0),
-        pos=input_ids.size(1),
+        pos=max_len,  # Use max_len for position_ids in subsequent calls
         cache=outputs.past_key_values,
         start_time=time.time(),
         timeout_seconds=timeout_seconds,
