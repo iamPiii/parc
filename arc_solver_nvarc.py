@@ -565,16 +565,14 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
     print(f"[DEBUG DFS] Starting inference_turbo_dfs with {len(prefix_tokens)} sequences", flush=True)
     sys.stdout.flush()
 
-    print(f"[DEBUG DFS] Converting tokens to tensor...", flush=True)
-    sys.stdout.flush()
-    try:
-        input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
-        print(f"[DEBUG DFS] Tensor created: shape={input_ids.shape}, device={input_ids.device}, dtype={input_ids.dtype}", flush=True)
-        sys.stdout.flush()
-    except Exception as e:
-        print(f"[DEBUG DFS] ERROR creating tensor: {e}", flush=True)
-        sys.stdout.flush()
-        raise
+    # Pad sequences to same length (like calc_scores in original NVARC)
+    batch_lengths = [len(tokens) for tokens in prefix_tokens]
+    max_len = max(batch_lengths)
+    padded_tokens = []
+    for tokens in prefix_tokens:
+        padded = tokens + [PAD_ID] * (max_len - len(tokens))
+        padded_tokens.append(padded)
+    input_ids = torch.tensor(padded_tokens, device=model.device, dtype=torch.long)
 
     print(f"[DEBUG DFS] Running model forward pass (first call may take 60-120s for compilation)...", flush=True)
     sys.stdout.flush()
