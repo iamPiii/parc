@@ -25,6 +25,13 @@ from contextlib import redirect_stdout, redirect_stderr
 # See: https://github.com/unslothai/unsloth/issues/668
 os.environ['TORCH_COMPILE'] = '0'
 os.environ['TORCHINDUCTOR_DISABLE'] = '1'
+# Disable Unsloth's compilation features that use Triton
+# See: https://unsloth.ai/docs/basics/troubleshooting-and-faqs
+os.environ['UNSLOTH_COMPILE_DISABLE'] = '1'
+os.environ['UNSLOTH_DISABLE_FAST_GENERATION'] = '1'
+# Fallback: Disable Triton JIT compilation entirely (uses CPU interpreter - slower)
+# Uncomment if the above doesn't work:
+# os.environ['TRITON_INTERPRET'] = '1'
 
 import numpy as np
 import torch
