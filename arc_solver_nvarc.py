@@ -486,25 +486,25 @@ def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, star
 
 @torch.no_grad()
 def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout_seconds):
-    """Run beam search DFS inference."""
+    """Run beam search DFS inference.
+
+    IMPORTANT: Match original NVARC exactly - NO padding, NO attention_mask.
+    Original assumes all sequences in batch have same length.
+    """
     import sys
     print(f"[DEBUG DFS] Starting inference_turbo_dfs with {len(prefix_tokens)} sequences", flush=True)
     sys.stdout.flush()
 
-    # Pad sequences to same length
+    # Match original NVARC: convert directly to tensor (no padding, no attention mask)
+    # This assumes all sequences in the batch have the same length
     batch_lengths = [len(tokens) for tokens in prefix_tokens]
-    max_len = max(batch_lengths)
-    padded_tokens = []
-    for tokens in prefix_tokens:
-        padded = tokens + [PAD_ID] * (max_len - len(tokens))
-        padded_tokens.append(padded)
-    input_ids = torch.tensor(padded_tokens, device=model.device, dtype=torch.long)
+    if len(set(batch_lengths)) > 1:
+        print(f"[WARNING] Sequences have different lengths: {batch_lengths}", flush=True)
+        print(f"[WARNING] This may cause issues - original NVARC expects same-length sequences", flush=True)
 
-    # Create attention mask to ignore padding
-    attention_mask = torch.zeros_like(input_ids)
-    for i, length in enumerate(batch_lengths):
-        attention_mask[i, :length] = 1
+    input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
 
+    print(f"[DEBUG DFS] Input shape: {input_ids.shape}", flush=True)
     print(f"[DEBUG DFS] Running model forward pass (first call may take 60-120s for compilation)...", flush=True)
     sys.stdout.flush()
 
@@ -530,7 +530,8 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
     heartbeat_thread.start()
 
     try:
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True, use_cache=True)
+        # Match original NVARC exactly: NO attention_mask parameter
+        outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
 
         # Stop heartbeat
         heartbeat_active.clear()
@@ -555,11 +556,13 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
     print(f"[DEBUG DFS] Starting turbo_dfs recursion...", flush=True)
     sys.stdout.flush()
 
-    # Extract logits at actual last positions (not padded positions)
-    last_logits = []
-    for i, length in enumerate(batch_lengths):
-        last_logits.append(outputs.logits[i, length - 1])
-    last_logits = torch.stack(last_logits)
+    # Match original NVARC exactly: extract last position for all sequences
+    # (assumes all have same length, so [:, -1] is correct for all)
+    last_logits = outputs.logits[:, -1]
+
+    print(f"[DEBUG DFS] Extracted logits shape: {last_logits.shape}", flush=True)
+    print(f"[DEBUG DFS] Sample logits stats - min: {last_logits.min().item():.4f}, max: {last_logits.max().item():.4f}, mean: {last_logits.mean().item():.4f}", flush=True)
+    sys.stdout.flush()
 
     suffixes = turbo_dfs(
         model,
@@ -567,7 +570,7 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
         max_new_tokens=max_new_tokens,
         max_score=max_score,
         scores=[0.0] * input_ids.size(0),
-        pos=max_len,  # Use max_len for position_ids in subsequent calls
+        pos=input_ids.size(1),  # Match original: use actual sequence length
         cache=outputs.past_key_values,
         start_time=time.time(),
         timeout_seconds=timeout_seconds,
