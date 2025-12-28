@@ -650,7 +650,7 @@ class ARCSolver:
         ttt_augment_n: int = 4,
         ttt_learning_rate: float = 5e-5,
         ttt_epochs: int = 1,
-        enable_ttt: bool = True,
+        enable_ttt: bool = False,
         # Inference hyperparameters
         inference_augment_n: int = 2,
         inference_timeout: float = 540.0,  # 9 minutes per puzzle
