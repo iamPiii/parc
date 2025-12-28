@@ -14,11 +14,27 @@ import os
 import time
 import json
 import logging
+import sys
+import faulthandler
+import signal
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from collections import defaultdict
 from contextlib import redirect_stdout, redirect_stderr
+
+# Enable faulthandler to get Python traceback on segfault
+faulthandler.enable(file=sys.stderr)
+
+# Signal handler for SIGSEGV
+def sigsegv_handler(signum, frame):
+    print("\n[FATAL] SIGSEGV (Segmentation Fault) caught!", file=sys.stderr, flush=True)
+    print(f"Signal: {signum}, Frame: {frame}", file=sys.stderr, flush=True)
+    faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+    sys.stderr.flush()
+    sys.exit(139)
+
+signal.signal(signal.SIGSEGV, sigsegv_handler)
 
 # Disable PyTorch Inductor/Dynamo JIT compilation to prevent segfaults
 # This must be set BEFORE importing torch
@@ -544,8 +560,37 @@ def turbo_dfs(model, logits, max_new_tokens, max_score, scores, pos, cache, star
 @torch.no_grad()
 def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout_seconds):
     """Run beam search DFS inference."""
-    input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
-    outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+    import sys
+    print(f"[DEBUG DFS] Starting inference_turbo_dfs with {len(prefix_tokens)} sequences", flush=True)
+    sys.stdout.flush()
+
+    print(f"[DEBUG DFS] Converting tokens to tensor...", flush=True)
+    sys.stdout.flush()
+    try:
+        input_ids = torch.tensor(prefix_tokens, device=model.device, dtype=torch.long)
+        print(f"[DEBUG DFS] Tensor created: shape={input_ids.shape}, device={input_ids.device}, dtype={input_ids.dtype}", flush=True)
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[DEBUG DFS] ERROR creating tensor: {e}", flush=True)
+        sys.stdout.flush()
+        raise
+
+    print(f"[DEBUG DFS] Running model forward pass...", flush=True)
+    sys.stdout.flush()
+    try:
+        outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+        print(f"[DEBUG DFS] Model forward pass completed", flush=True)
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[DEBUG DFS] ERROR in model forward pass: {e}", flush=True)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise
+
+    print(f"[DEBUG DFS] Starting turbo_dfs recursion...", flush=True)
+    sys.stdout.flush()
     suffixes = turbo_dfs(
         model,
         logits=outputs.logits[:, -1],
@@ -557,20 +602,31 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
         start_time=time.time(),
         timeout_seconds=timeout_seconds,
     )
+    print(f"[DEBUG DFS] turbo_dfs recursion completed, got {len(suffixes)} suffix groups", flush=True)
+    sys.stdout.flush()
+
     result = []
     for batch_id, beams in suffixes.items():
         sorted_beams = sorted(beams, key=lambda x: x[0])
         result.append((batch_id, sorted_beams))
+    print(f"[DEBUG DFS] Returning {len(result)} results", flush=True)
+    sys.stdout.flush()
     return result
 
 
 @torch.no_grad()
 def calc_scores(queries, answers, tokenizer, model):
     """Calculate scores for query-answer pairs."""
+    import sys
+    print(f"[DEBUG CALC_SCORES] Starting calc_scores with {len(queries)} queries", flush=True)
+    sys.stdout.flush()
+
     batch_query_tokens = []
     batch_answer_tokens = []
     batch_tokens = []
     batch_lengths = []
+    print(f"[DEBUG CALC_SCORES] Tokenizing {len(queries)} query-answer pairs...", flush=True)
+    sys.stdout.flush()
     for query, answer in zip(queries, answers):
         query_tokens = tokenizer.encode(query)
         answer_tokens = tokenizer.encode(answer)
@@ -579,20 +635,49 @@ def calc_scores(queries, answers, tokenizer, model):
         batch_answer_tokens.append(answer_tokens)
         batch_tokens.append(tokens)
         batch_lengths.append(len(tokens))
+    print(f"[DEBUG CALC_SCORES] Tokenization complete, max_len={max(batch_lengths)}", flush=True)
+    sys.stdout.flush()
+
     max_len = max(batch_lengths)
     padded_tokens = []
+    print(f"[DEBUG CALC_SCORES] Padding tokens to max_len={max_len}...", flush=True)
+    sys.stdout.flush()
     for tokens in batch_tokens:
         padded = tokens + [PAD_ID] * (max_len - len(tokens))
         padded_tokens.append(padded)
+    print(f"[DEBUG CALC_SCORES] Creating tensor...", flush=True)
+    sys.stdout.flush()
     input_ids = torch.tensor(padded_tokens, device=model.device, dtype=torch.long)
-    outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+    print(f"[DEBUG CALC_SCORES] Tensor created: shape={input_ids.shape}, device={input_ids.device}", flush=True)
+    sys.stdout.flush()
+
+    print(f"[DEBUG CALC_SCORES] Running model forward pass...", flush=True)
+    sys.stdout.flush()
+    try:
+        outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
+        print(f"[DEBUG CALC_SCORES] Model forward pass completed", flush=True)
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"[DEBUG CALC_SCORES] ERROR in model forward pass: {e}", flush=True)
+        sys.stdout.flush()
+        import traceback
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise
+
+    print(f"[DEBUG CALC_SCORES] Computing log_softmax...", flush=True)
+    sys.stdout.flush()
     batch_logits = outputs.logits.float().cpu().log_softmax(-1)
+    print(f"[DEBUG CALC_SCORES] Calculating scores...", flush=True)
+    sys.stdout.flush()
     result = []
     for logits, query_tokens, answer_tokens in zip(batch_logits, batch_query_tokens, batch_answer_tokens):
         query_length = len(query_tokens)
         answer_logits = logits[query_length - 1:query_length - 1 + len(answer_tokens)]
         answer_score = answer_logits[torch.arange(len(answer_tokens)), answer_tokens].sum()
         result.append(-answer_score.item())
+    print(f"[DEBUG CALC_SCORES] Scores calculated, returning {len(result)} scores", flush=True)
+    sys.stdout.flush()
     return result
 
 
@@ -880,16 +965,27 @@ class ARCSolver:
             print("[DEBUG] Test-time training completed")
 
         # Set model to inference mode
-        print("[DEBUG] Setting model to inference mode...")
+        print("[DEBUG] Setting model to inference mode...", flush=True)
+        sys.stdout.flush()
         self.model = self._FastLanguageModel.for_inference(self.model)
+        print("[DEBUG] Model set to inference mode", flush=True)
+        sys.stdout.flush()
 
+        print("[DEBUG] Collecting garbage...", flush=True)
+        sys.stdout.flush()
         gc.collect()
+        print("[DEBUG] Clearing CUDA cache...", flush=True)
+        sys.stdout.flush()
         torch.cuda.empty_cache()
-        print("[DEBUG] Memory cleared, starting inference...")
+        print("[DEBUG] Memory cleared, starting inference...", flush=True)
+        sys.stdout.flush()
 
         # Run inference
+        print("[DEBUG] Calling _run_inference()...", flush=True)
+        sys.stdout.flush()
         predictions = self._run_inference(puzzle_ds, start_time)
-        print(f"[DEBUG] Inference completed, got {len(predictions)} predictions")
+        print(f"[DEBUG] Inference completed, got {len(predictions)} predictions", flush=True)
+        sys.stdout.flush()
 
         if not predictions:
             # Fallback: return the test input
@@ -1027,24 +1123,47 @@ class ARCSolver:
 
     def _run_inference(self, puzzle_ds: NVARCDataset, start_time: float) -> List[np.ndarray]:
         """Run inference with augmentation and decoding."""
+        import sys
+        print("[DEBUG INFERENCE] Starting _run_inference()", flush=True)
+        sys.stdout.flush()
+
         # Split for multi-reply handling
+        print("[DEBUG INFERENCE] Calling split_multi_replies()...", flush=True)
+        sys.stdout.flush()
         puzzle_ds_multi = puzzle_ds.split_multi_replies()
+        print(f"[DEBUG INFERENCE] Split complete, {len(puzzle_ds_multi.keys)} keys", flush=True)
+        sys.stdout.flush()
 
         # Augment for inference
+        print(f"[DEBUG INFERENCE] Starting augmentation (n={self.inference_augment_n})...", flush=True)
+        sys.stdout.flush()
         eval_ds = puzzle_ds_multi.augment(n=self.inference_augment_n, seed=2)
+        print(f"[DEBUG INFERENCE] Augmentation complete, {len(eval_ds.keys)} keys", flush=True)
+        sys.stdout.flush()
+
+        print(f"[DEBUG INFERENCE] Cutting to max length {self.max_seq_length - self.max_new_tokens}...", flush=True)
+        sys.stdout.flush()
         eval_ds = eval_ds.cut_to_len(
             formatter=self.formatter,
             name="input",
             max_len=self.max_seq_length - self.max_new_tokens
         )
+        print(f"[DEBUG INFERENCE] Cut complete, {len(eval_ds.keys)} keys", flush=True)
+        sys.stdout.flush()
 
         # Group by test ID
+        print("[DEBUG INFERENCE] Grouping by test ID...", flush=True)
+        sys.stdout.flush()
         test_id_to_subkeys = defaultdict(list)
         for subkey in sorted(eval_ds.keys):
             test_id = subkey.split(".")[0].split("_")[1]
             test_id_to_subkeys[test_id].append(subkey)
+        print(f"[DEBUG INFERENCE] Grouped into {len(test_id_to_subkeys)} test IDs", flush=True)
+        sys.stdout.flush()
 
         # Create batches for inference
+        print("[DEBUG INFERENCE] Creating batches for inference...", flush=True)
+        sys.stdout.flush()
         batches = []
         for test_id, subkeys in test_id_to_subkeys.items():
             batch = []
@@ -1072,80 +1191,170 @@ class ARCSolver:
             if batch:
                 batches.append(batch)
 
+        print(f"[DEBUG INFERENCE] Created {len(batches)} batches", flush=True)
+        sys.stdout.flush()
+
         decoded_results = {}
         known_scores = {}
 
+        print("[DEBUG INFERENCE] Entering inference_mode context...", flush=True)
+        sys.stdout.flush()
         with torch.inference_mode():
-            for subkeys in batches:
+            print(f"[DEBUG INFERENCE] Starting batch loop ({len(batches)} batches)...", flush=True)
+            sys.stdout.flush()
+            for batch_idx, subkeys in enumerate(batches):
+                print(f"[DEBUG INFERENCE] === Batch {batch_idx + 1}/{len(batches)} (size={len(subkeys)}) ===", flush=True)
+                sys.stdout.flush()
+
                 if not subkeys:
+                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1} is empty, skipping", flush=True)
+                    sys.stdout.flush()
                     continue
 
                 elapsed = time.time() - start_time
+                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: elapsed time = {elapsed:.1f}s", flush=True)
+                sys.stdout.flush()
+
                 if elapsed > self.inference_timeout:
+                    print(f"[DEBUG INFERENCE] Timeout reached after {elapsed:.1f}s", flush=True)
+                    sys.stdout.flush()
                     print(f"Inference timeout after {elapsed:.1f}s")
                     break
 
                 # Tokenize inputs
+                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Tokenizing {len(subkeys)} inputs...", flush=True)
+                sys.stdout.flush()
                 tokens = []
-                for subkey in subkeys:
+                for subkey_idx, subkey in enumerate(subkeys):
+                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Tokenizing subkey {subkey_idx + 1}/{len(subkeys)}: {subkey}", flush=True)
+                    sys.stdout.flush()
                     data = eval_ds.get(subkey, self.formatter)
-                    tokens.append(self.tokenizer.encode(data["input"]))
+                    encoded = self.tokenizer.encode(data["input"])
+                    tokens.append(encoded)
+                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Subkey {subkey_idx + 1} tokenized ({len(encoded)} tokens)", flush=True)
+                    sys.stdout.flush()
+
+                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: All inputs tokenized", flush=True)
+                sys.stdout.flush()
 
                 # Run beam search
                 remaining_time = self.inference_timeout - elapsed
-                dfs_result = inference_turbo_dfs(
-                    self.model, tokens,
-                    self.max_new_tokens,
-                    self.max_score,
-                    remaining_time
-                )
+                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Starting beam search (timeout={remaining_time:.1f}s)...", flush=True)
+                sys.stdout.flush()
+                try:
+                    dfs_result = inference_turbo_dfs(
+                        self.model, tokens,
+                        self.max_new_tokens,
+                        self.max_score,
+                        remaining_time
+                    )
+                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam search completed, got {len(dfs_result)} results", flush=True)
+                    sys.stdout.flush()
+                except Exception as e:
+                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: ERROR in beam search: {e}", flush=True)
+                    sys.stdout.flush()
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    raise
 
                 # Process results
-                for subkey_id, scored_beams in dfs_result:
+                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Processing {len(dfs_result)} results...", flush=True)
+                sys.stdout.flush()
+                for result_idx, (subkey_id, scored_beams) in enumerate(dfs_result):
+                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Processing result {result_idx + 1}/{len(dfs_result)}, subkey_id={subkey_id}, {len(scored_beams)} beams", flush=True)
+                    sys.stdout.flush()
+
                     if subkey_id >= len(subkeys):
+                        print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Skipping result {result_idx + 1} - subkey_id {subkey_id} >= {len(subkeys)}", flush=True)
+                        sys.stdout.flush()
                         continue
+
                     subkey = subkeys[subkey_id]
                     bk = subkey.split(".")[0]
+                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Result {result_idx + 1} - subkey={subkey}, bk={bk}", flush=True)
+                    sys.stdout.flush()
 
-                    for beam_score, beam_tokens in scored_beams:
+                    for beam_idx, (beam_score, beam_tokens) in enumerate(scored_beams):
+                        print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Processing beam {beam_idx + 1}/{len(scored_beams)}, score={beam_score}, {len(beam_tokens)} tokens", flush=True)
+                        sys.stdout.flush()
+                        print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Converting beam {beam_idx + 1} to array...", flush=True)
+                        sys.stdout.flush()
                         array = self.formatter.convert_tokens_to_array(beam_tokens)
                         if array is None:
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - array is None, skipping", flush=True)
+                            sys.stdout.flush()
                             continue
 
+                        print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - inverting transformations...", flush=True)
+                        sys.stdout.flush()
                         solution = NVARCDataset.invert_mod(array, subkey, inv_perm=True)
 
                         grid_id = (bk, hashable(solution))
+                        print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - solution shape={solution.shape}", flush=True)
+                        sys.stdout.flush()
 
                         if grid_id in known_scores:
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - using cached scores", flush=True)
+                            sys.stdout.flush()
                             augmented_scores = known_scores[grid_id]
                         else:
                             # Score the solution
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - creating augmented dataset for scoring...", flush=True)
+                            sys.stdout.flush()
                             aug_dataset = NVARCDataset(
                                 keys=[bk],
                                 queries={bk: puzzle_ds_multi.queries.get(bk)},
                                 replies={bk: [solution.tolist()]},
                             )
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - augmenting dataset...", flush=True)
+                            sys.stdout.flush()
                             aug_dataset = aug_dataset.augment(seed=hash(bk) % (1024 ** 2))
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - cutting dataset...", flush=True)
+                            sys.stdout.flush()
                             aug_dataset = aug_dataset.cut_to_len(
                                 formatter=self.formatter,
                                 name="input",
                                 max_len=self.max_seq_length - self.max_new_tokens
                             )
 
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - preparing augmented queries...", flush=True)
+                            sys.stdout.flush()
                             aug_queries = []
                             aug_answers = []
                             for augmented_sample in aug_dataset.as_list(self.formatter):
                                 aug_queries.append(augmented_sample["input"])
                                 aug_answers.append(augmented_sample["reply"])
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - prepared {len(aug_queries)} augmented queries", flush=True)
+                            sys.stdout.flush()
 
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - calculating scores...", flush=True)
+                            sys.stdout.flush()
                             if len(aug_queries) >= 4:
+                                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - calc_scores batch 1 (4 queries)...", flush=True)
+                                sys.stdout.flush()
                                 augmented_scores1 = calc_scores(aug_queries[:4], aug_answers[:4], self.tokenizer, self.model)
-                                augmented_scores2 = calc_scores(aug_queries[4:], aug_answers[4:], self.tokenizer, self.model) if len(aug_queries) > 4 else []
+                                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - calc_scores batch 1 complete", flush=True)
+                                sys.stdout.flush()
+                                if len(aug_queries) > 4:
+                                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - calc_scores batch 2 ({len(aug_queries) - 4} queries)...", flush=True)
+                                    sys.stdout.flush()
+                                    augmented_scores2 = calc_scores(aug_queries[4:], aug_answers[4:], self.tokenizer, self.model)
+                                    print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - calc_scores batch 2 complete", flush=True)
+                                    sys.stdout.flush()
+                                else:
+                                    augmented_scores2 = []
                                 augmented_scores = augmented_scores1 + augmented_scores2
                             else:
+                                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - calc_scores ({len(aug_queries)} queries)...", flush=True)
+                                sys.stdout.flush()
                                 augmented_scores = calc_scores(aug_queries, aug_answers, self.tokenizer, self.model)
+                                print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - calc_scores complete", flush=True)
+                                sys.stdout.flush()
 
                             known_scores[grid_id] = augmented_scores
+                            print(f"[DEBUG INFERENCE] Batch {batch_idx + 1}: Beam {beam_idx + 1} - scores cached", flush=True)
+                            sys.stdout.flush()
 
                         result_key = f"{subkey}.out{len(decoded_results.get(bk, {}))}"
                         if bk not in decoded_results:
