@@ -45,9 +45,7 @@ os.environ['TORCHINDUCTOR_DISABLE'] = '1'
 # See: https://unsloth.ai/docs/basics/troubleshooting-and-faqs
 os.environ['UNSLOTH_COMPILE_DISABLE'] = '1'
 os.environ['UNSLOTH_DISABLE_FAST_GENERATION'] = '1'
-# Fallback: Disable Triton JIT compilation entirely (uses CPU interpreter - slower)
-# Uncomment if the above doesn't work:
-# os.environ['TRITON_INTERPRET'] = '1'
+
 
 import numpy as np
 import torch
@@ -575,14 +573,47 @@ def inference_turbo_dfs(model, prefix_tokens, max_new_tokens, max_score, timeout
         sys.stdout.flush()
         raise
 
-    print(f"[DEBUG DFS] Running model forward pass...", flush=True)
+    print(f"[DEBUG DFS] Running model forward pass (first call may take 60-120s for compilation)...", flush=True)
     sys.stdout.flush()
+
+    # Sync CUDA to ensure previous operations are complete
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    forward_start = time.time()
+
+    # Start a heartbeat thread to show progress during compilation
+    import threading
+    heartbeat_active = threading.Event()
+    heartbeat_active.set()
+
+    def heartbeat():
+        while heartbeat_active.is_set():
+            elapsed = time.time() - forward_start
+            print(f"[DEBUG DFS] Still running... elapsed: {elapsed:.1f}s", flush=True)
+            sys.stdout.flush()
+            time.sleep(10)  # Print every 10 seconds
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+
     try:
         outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
-        print(f"[DEBUG DFS] Model forward pass completed", flush=True)
+
+        # Stop heartbeat
+        heartbeat_active.clear()
+
+        # Sync again to ensure forward pass is complete
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        forward_time = time.time() - forward_start
+        print(f"[DEBUG DFS] Model forward pass completed in {forward_time:.2f}s", flush=True)
         sys.stdout.flush()
     except Exception as e:
-        print(f"[DEBUG DFS] ERROR in model forward pass: {e}", flush=True)
+        heartbeat_active.clear()
+        forward_time = time.time() - forward_start
+        print(f"[DEBUG DFS] ERROR in model forward pass after {forward_time:.2f}s: {e}", flush=True)
         sys.stdout.flush()
         import traceback
         traceback.print_exc()
@@ -653,12 +684,25 @@ def calc_scores(queries, answers, tokenizer, model):
 
     print(f"[DEBUG CALC_SCORES] Running model forward pass...", flush=True)
     sys.stdout.flush()
+
+    # Sync CUDA before forward pass
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    forward_start = time.time()
     try:
         outputs = model(input_ids=input_ids, return_dict=True, use_cache=True)
-        print(f"[DEBUG CALC_SCORES] Model forward pass completed", flush=True)
+
+        # Sync CUDA after forward pass
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        forward_time = time.time() - forward_start
+        print(f"[DEBUG CALC_SCORES] Model forward pass completed in {forward_time:.2f}s", flush=True)
         sys.stdout.flush()
     except Exception as e:
-        print(f"[DEBUG CALC_SCORES] ERROR in model forward pass: {e}", flush=True)
+        forward_time = time.time() - forward_start
+        print(f"[DEBUG CALC_SCORES] ERROR in model forward pass after {forward_time:.2f}s: {e}", flush=True)
         sys.stdout.flush()
         import traceback
         traceback.print_exc()
