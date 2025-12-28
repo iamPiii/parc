@@ -36,19 +36,10 @@ def sigsegv_handler(signum, frame):
 
 signal.signal(signal.SIGSEGV, sigsegv_handler)
 
-# Disable PyTorch Inductor/Dynamo JIT compilation to prevent segfaults
-# This must be set BEFORE importing torch
-# See: https://github.com/unslothai/unsloth/issues/668
+# Disable PyTorch JIT compilation to prevent issues
 os.environ['TORCH_COMPILE'] = '0'
 os.environ['TORCHINDUCTOR_DISABLE'] = '1'
-# Disable Unsloth's compilation features that use Triton
-# See: https://unsloth.ai/docs/basics/troubleshooting-and-faqs
-os.environ['UNSLOTH_COMPILE_DISABLE'] = '1'
-os.environ['UNSLOTH_DISABLE_FAST_GENERATION'] = '1'
-# Force Triton to use interpreter mode to prevent deadlocks during JIT compilation
-# This is slower but prevents the process from hanging forever
-os.environ['TRITON_INTERPRET'] = '1'
-print("[STARTUP] TRITON_INTERPRET=1 enabled - using interpreter mode (slower but stable)", flush=True)
+print("[STARTUP] Using standard transformers + peft (no Unsloth)", flush=True)
 
 import numpy as np
 import torch
@@ -56,7 +47,18 @@ import torch
 # Also disable dynamo after torch import
 torch._dynamo.config.disable = True
 from datasets import Dataset
-from transformers import DataCollatorForLanguageModeling, AutoTokenizer
+from transformers import (
+    DataCollatorForLanguageModeling,
+    AutoTokenizer,
+    AutoModelForCausalLM,
+)
+from peft import (
+    get_peft_model,
+    LoraConfig,
+    TaskType,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+)
 
 logging.disable(logging.WARNING)
 
@@ -377,85 +379,9 @@ class NVARCDataset:
 
 
 # ============================================================================
-# Fixed Unsloth Trainer (from NVARC reference)
+# Standard Trainer (no Unsloth)
 # ============================================================================
-
-class UnslothFixedTrainer:
-    """Wrapper to handle Unsloth trainer import and initialization."""
-
-    @staticmethod
-    def create_trainer(UnslothTrainer_class, **kwargs):
-        """Create a fixed trainer that handles Unsloth's view tensor issue."""
-
-        class FixedTrainer(UnslothTrainer_class):
-            def training_step(self, model, inputs, num_items_in_batch=None):
-                """Override training_step to add detailed logging."""
-                print(f"[DEBUG TRAINER] training_step called", flush=True)
-                print(f"[DEBUG TRAINER]   - Input keys: {list(inputs.keys())}", flush=True)
-                for k, v in inputs.items():
-                    if hasattr(v, 'shape'):
-                        print(f"[DEBUG TRAINER]   - {k} shape: {v.shape}, dtype: {v.dtype}, device: {v.device}", flush=True)
-
-                print("[DEBUG TRAINER]   - Calling model.train()...", flush=True)
-                model.train()
-
-                print("[DEBUG TRAINER]   - Moving inputs to device...", flush=True)
-                inputs = self._prepare_inputs(inputs)
-
-                print("[DEBUG TRAINER]   - Entering autocast context...", flush=True)
-                with self.compute_loss_context_manager():
-                    print("[DEBUG TRAINER]   - Computing loss...", flush=True)
-                    loss = self.compute_loss(model, inputs)
-
-                print(f"[DEBUG TRAINER]   - Loss computed: {loss.item() if hasattr(loss, 'item') else loss}", flush=True)
-
-                # Handle gradient accumulation
-                del inputs
-                if (
-                    self.args.n_gpu > 1
-                    or self.accelerator.num_processes > 1
-                ):
-                    loss = loss / self.args.gradient_accumulation_steps
-
-                print("[DEBUG TRAINER]   - Calling accelerator.backward()...", flush=True)
-                self.accelerator.backward(loss)
-                print("[DEBUG TRAINER]   - Backward pass completed", flush=True)
-
-                return loss.detach()
-
-            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-                """Fixed compute_loss that handles Unsloth's view tensor issue"""
-                print("[DEBUG TRAINER] compute_loss called", flush=True)
-
-                if self.label_smoother is not None and "labels" in inputs:
-                    labels = inputs.pop("labels")
-                else:
-                    labels = None
-
-                print("[DEBUG TRAINER]   - Running model forward pass...", flush=True)
-                outputs = model(**inputs)
-                print("[DEBUG TRAINER]   - Model forward pass completed", flush=True)
-
-                if labels is not None:
-                    unwrapped_model = self.accelerator.unwrap_model(model)
-                    if hasattr(unwrapped_model, "_get_name") and "unsloth" in unwrapped_model._get_name().lower():
-                        loss = self.label_smoother(outputs, labels, shift_labels=True)
-                    else:
-                        loss = self.label_smoother(outputs, labels)
-                else:
-                    loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
-                print(f"[DEBUG TRAINER]   - Raw loss: {loss.item() if hasattr(loss, 'item') else loss}", flush=True)
-
-                # KEY FIX: Clone the loss tensor before in-place operations
-                if hasattr(loss, "clone"):
-                    loss = loss.clone()  # Converts view tensor to independent tensor
-                # Now safe for DDP gradient scaling
-                if self.accelerator.num_processes > 1:
-                    loss = loss * self.accelerator.num_processes
-                return (loss, outputs) if return_outputs else loss
-
-        return FixedTrainer(**kwargs)
+# Using standard transformers Trainer - no custom overrides needed
 
 
 # ============================================================================
@@ -776,18 +702,13 @@ class ARCSolver:
         cache_dir: Optional[str] = None,
         max_seq_length: int = 512,
         device: Optional[str] = None,
-        # TTT hyperparameters
-        ttt_augment_n: int = 4,
-        ttt_learning_rate: float = 5e-5,
-        ttt_epochs: int = 1,
-        enable_ttt: bool = False,
         # Inference hyperparameters
         inference_augment_n: int = 2,
         inference_timeout: float = 540.0,  # 9 minutes per puzzle
         beam_threshold: float = 0.2,
     ) -> None:
         """
-        Initialize the NVARC solver.
+        Initialize the NVARC solver (inference-only, no training).
 
         Args:
             checkpoint_path: Direct path to model checkpoint
@@ -795,10 +716,6 @@ class ARCSolver:
             cache_dir: Local cache directory for models
             max_seq_length: Maximum sequence length
             device: Device to use (cuda/cpu)
-            ttt_augment_n: Number of augmentations for TTT
-            ttt_learning_rate: Learning rate for TTT
-            ttt_epochs: Number of epochs for TTT
-            enable_ttt: Whether to enable test-time training
             inference_augment_n: Number of augmentations for inference
             inference_timeout: Timeout for inference in seconds
             beam_threshold: Probability threshold for beam search
@@ -823,38 +740,15 @@ class ARCSolver:
             print(f"  NVIDIA_VISIBLE_DEVICES: {os.environ.get('NVIDIA_VISIBLE_DEVICES', 'not set')}")
         print("=" * 50 + "\n")
 
-        # Import unsloth here to avoid import errors if not installed
-        try:
-            from unsloth import FastLanguageModel, UnslothTrainingArguments, UnslothTrainer
-            from peft import get_peft_model_state_dict, set_peft_model_state_dict
-        except ImportError as e:
-            raise ImportError(
-                "NVARC solver requires 'unsloth' and 'peft' packages. "
-                "Install with: pip install unsloth peft"
-            ) from e
-
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.max_seq_length = max_seq_length
 
         print(f"Using device: {self.device}")
 
-        # TTT hyperparameters
-        self.ttt_augment_n = ttt_augment_n
-        self.ttt_learning_rate = ttt_learning_rate
-        self.ttt_epochs = ttt_epochs
-        self.enable_ttt = enable_ttt
-
         # Inference hyperparameters
         self.inference_augment_n = inference_augment_n
         self.inference_timeout = inference_timeout
         self.max_score = -np.log(beam_threshold)
-
-        # Store imports for later use
-        self._FastLanguageModel = FastLanguageModel
-        self._UnslothTrainingArguments = UnslothTrainingArguments
-        self._UnslothTrainer = UnslothTrainer
-        self._get_peft_model_state_dict = get_peft_model_state_dict
-        self._set_peft_model_state_dict = set_peft_model_state_dict
 
         # Determine model path
         if checkpoint_path is not None:
@@ -872,77 +766,52 @@ class ARCSolver:
                 model_path = repo_id
                 print(f"Using HuggingFace repo: {model_path}")
 
-        # PEFT parameters
-        self.peft_params = dict(
+        # PEFT/LoRA configuration (for model structure, but no training)
+        self.peft_config = LoraConfig(
             r=32,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj", "embed_tokens", "lm_head"],
             lora_alpha=32,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             lora_dropout=0.0,
             bias="none",
-            use_gradient_checkpointing=False,
-            random_state=42,
+            task_type=TaskType.CAUSAL_LM,
             use_rslora=True,
-            loftq_config=None,
         )
 
-        # Training arguments
-        self.train_args = dict(
-            output_dir="/app/models/.trainer_tmp",
-            per_device_eval_batch_size=1,
-            per_device_train_batch_size=1,
-            gradient_accumulation_steps=1,
-            num_train_epochs=self.ttt_epochs,
-            warmup_steps=0,
-            warmup_ratio=0.1,
-            max_grad_norm=1.0,
-            learning_rate=self.ttt_learning_rate,
-            optim="adamw_torch",
-            weight_decay=0.0,
-            lr_scheduler_type="cosine",
-            seed=42,
-            report_to="none",
-            save_strategy="no",
-            eval_strategy="no",
-            logging_strategy="no",
-            fp16=False,
-            bf16=True,
-            fsdp="",
-            ddp_find_unused_parameters=False,
-            dataloader_num_workers=0,
-            gradient_checkpointing=False,
-        )
-
-        # Load model
-        print(f"Loading NVARC model from {model_path}...")
+        # Load model with transformers
+        print(f"Loading model from {model_path}...")
 
         # Determine device_map based on CUDA availability
         if torch.cuda.is_available():
-            device_map = "cuda:0"
+            device_map = "auto"
             print(f"Loading model to GPU (device_map={device_map})")
         else:
             device_map = "cpu"
             print(f"WARNING: Loading model to CPU - this will be slow!")
 
-        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_path,
-            full_finetuning=False,
-            load_in_4bit=False,
-            local_files_only=(checkpoint_path is not None),
-            use_gradient_checkpointing=False,
-            max_seq_length=max_seq_length,
+        # Load base model
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
             device_map=device_map,
+            local_files_only=(checkpoint_path is not None),
+            trust_remote_code=True,
         )
 
-        # Apply PEFT
-        self.model = FastLanguageModel.get_peft_model(self.model, **self.peft_params)
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=(checkpoint_path is not None),
+            trust_remote_code=True,
+        )
 
-        # Convert to bfloat16
-        for name, param in self.model.named_parameters():
-            if param.dtype == torch.float32:
-                param.data = param.data.to(torch.bfloat16)
+        # Apply PEFT/LoRA
+        self.model = get_peft_model(self.model, self.peft_config)
+
+        # Set model to eval mode for inference
+        self.model.eval()
 
         # Store default weights for reset
-        self.default_weights = self._get_peft_model_state_dict(self.model, adapter_name="default")
+        self.default_weights = get_peft_model_state_dict(self.model, adapter_name="default")
         self.default_weights = {k: v.clone().detach() for k, v in self.default_weights.items()}
 
         # Create formatter and collator
@@ -995,26 +864,16 @@ class ARCSolver:
         puzzle_ds = NVARCDataset(queries=queries, replies=replies, keys=[task_key])
         print("[DEBUG] Dataset created")
 
-        # Reset model weights
-        self._set_peft_model_state_dict(
+        # Reset model weights to default
+        set_peft_model_state_dict(
             self.model,
             deepcopy(self.default_weights),
             adapter_name="default",
         )
-        print("[DEBUG] Model weights reset")
+        print("[DEBUG] Model weights reset to default")
 
-        # Test-time training
-        if self.enable_ttt and train_examples:
-            print("[DEBUG] Starting test-time training...")
-            self._test_time_train(puzzle_ds)
-            print("[DEBUG] Test-time training completed")
-
-        # Set model to inference mode
-        print("[DEBUG] Setting model to inference mode...", flush=True)
-        sys.stdout.flush()
-        self.model = self._FastLanguageModel.for_inference(self.model)
-        print("[DEBUG] Model set to inference mode", flush=True)
-        sys.stdout.flush()
+        # Ensure model is in eval mode
+        self.model.eval()
 
         print("[DEBUG] Collecting garbage...", flush=True)
         sys.stdout.flush()
@@ -1045,126 +904,6 @@ class ARCSolver:
 
         return result
 
-    def _test_time_train(self, puzzle_ds: NVARCDataset) -> None:
-        """Perform test-time training on the training examples."""
-        print("[DEBUG TTT] Setting model to training mode...")
-        # Set model to training mode
-        self.model = self._FastLanguageModel.for_training(self.model)
-        print("[DEBUG TTT] Model set to training mode")
-
-        # Check GPU memory before augmentation
-        if torch.cuda.is_available():
-            print(f"[DEBUG TTT] GPU Memory before augmentation: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
-
-        # Augment training data
-        print(f"[DEBUG TTT] Starting data augmentation (n={self.ttt_augment_n})...")
-        train_ds = puzzle_ds.augment(n=self.ttt_augment_n, shfl_keys=True, seed=1)
-        print(f"[DEBUG TTT] Augmentation complete, dataset has {len(train_ds.keys)} keys")
-
-        print(f"[DEBUG TTT] Cutting to max length {self.max_seq_length}...")
-        train_ds = train_ds.cut_to_len(
-            formatter=self.formatter,
-            name="text",
-            max_len=self.max_seq_length
-        )
-        print(f"[DEBUG TTT] After cutting, dataset has {len(train_ds.keys)} keys")
-
-        # Check GPU memory after augmentation
-        if torch.cuda.is_available():
-            print(f"[DEBUG TTT] GPU Memory after augmentation: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
-
-        # Create trainer
-        print("[DEBUG TTT] Converting dataset to list...")
-        train_list = train_ds.as_list(self.formatter)
-        print(f"[DEBUG TTT] Training dataset size: {len(train_list)} examples")
-
-        print("[DEBUG TTT] Creating training arguments...")
-        import sys
-        sys.stdout.flush()
-        sys.stderr.flush()
-
-        training_args = self._UnslothTrainingArguments(**self.train_args)
-        print(f"[DEBUG TTT] Training args created: output_dir={training_args.output_dir}")
-        sys.stdout.flush()
-
-        print("[DEBUG TTT] Creating HuggingFace dataset...")
-        sys.stdout.flush()
-        hf_dataset = Dataset.from_list(train_list)
-        print(f"[DEBUG TTT] HF Dataset created: {len(hf_dataset)} examples")
-        sys.stdout.flush()
-
-        print("[DEBUG TTT] Initializing UnslothTrainer (this may take a moment)...")
-        sys.stdout.flush()
-
-        # Don't suppress output so we can see errors
-        trainer = UnslothFixedTrainer.create_trainer(
-            self._UnslothTrainer,
-            model=self.model,
-            tokenizer=self.tokenizer,
-            data_collator=self.collator,
-            train_dataset=hf_dataset,
-            dataset_text_field="text",
-            max_seq_length=self.max_seq_length,
-            args=training_args,
-        )
-        print("[DEBUG TTT] Trainer created successfully")
-        sys.stdout.flush()
-
-        # Check GPU memory before training
-        if torch.cuda.is_available():
-            print(f"[DEBUG TTT] GPU Memory before training: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB allocated, {torch.cuda.memory_reserved(0) / 1024**3:.2f} GB cached")
-            sys.stdout.flush()
-
-        # Add debug callback to track training progress
-        from transformers import TrainerCallback
-        import signal
-        import faulthandler
-
-        # Enable faulthandler to get Python traceback on segfault
-        faulthandler.enable()
-
-        class DebugCallback(TrainerCallback):
-            def on_train_begin(self, args, state, control, **kwargs):
-                print("[DEBUG CALLBACK] on_train_begin called")
-                sys.stdout.flush()
-
-            def on_step_begin(self, args, state, control, **kwargs):
-                print(f"[DEBUG CALLBACK] on_step_begin: step {state.global_step}")
-                sys.stdout.flush()
-
-            def on_step_end(self, args, state, control, **kwargs):
-                print(f"[DEBUG CALLBACK] on_step_end: step {state.global_step}, loss={state.log_history[-1].get('loss', 'N/A') if state.log_history else 'N/A'}")
-                sys.stdout.flush()
-
-            def on_log(self, args, state, control, logs=None, **kwargs):
-                print(f"[DEBUG CALLBACK] on_log: {logs}")
-                sys.stdout.flush()
-
-        trainer.add_callback(DebugCallback())
-        print("[DEBUG TTT] Debug callback added")
-        sys.stdout.flush()
-
-        print("[DEBUG TTT] Starting trainer.train()...")
-        print("[DEBUG TTT] Trainer config:")
-        print(f"  - Model type: {type(self.model)}")
-        print(f"  - Dataset size: {len(hf_dataset)}")
-        print(f"  - Batch size: {training_args.per_device_train_batch_size}")
-        print(f"  - Gradient accumulation: {training_args.gradient_accumulation_steps}")
-        print(f"  - bf16: {training_args.bf16}")
-        print(f"  - fp16: {training_args.fp16}")
-        sys.stdout.flush()
-
-        trainer.train()
-        print("[DEBUG TTT] Training completed successfully")
-        sys.stdout.flush()
-
-        print("[DEBUG TTT] Unwrapping model...")
-        self.model = trainer.accelerator.unwrap_model(self.model, keep_fp32_wrapper=False)
-        print("[DEBUG TTT] Model unwrapped")
-
-        print("[DEBUG TTT] Deleting trainer...")
-        del trainer
-        print("[DEBUG TTT] Trainer deleted")
 
     def _run_inference(self, puzzle_ds: NVARCDataset, start_time: float) -> List[np.ndarray]:
         """Run inference with augmentation and decoding."""
