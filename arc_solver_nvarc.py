@@ -45,7 +45,10 @@ os.environ['TORCHINDUCTOR_DISABLE'] = '1'
 # See: https://unsloth.ai/docs/basics/troubleshooting-and-faqs
 os.environ['UNSLOTH_COMPILE_DISABLE'] = '1'
 os.environ['UNSLOTH_DISABLE_FAST_GENERATION'] = '1'
-
+# Force Triton to use interpreter mode to prevent deadlocks during JIT compilation
+# This is slower but prevents the process from hanging forever
+os.environ['TRITON_INTERPRET'] = '1'
+print("[STARTUP] TRITON_INTERPRET=1 enabled - using interpreter mode (slower but stable)", flush=True)
 
 import numpy as np
 import torch
