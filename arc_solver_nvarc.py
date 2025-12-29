@@ -105,8 +105,8 @@ EOS_ID = 15              # <|im_end|>
 # ============================================================================
 # LoRA Configuration - EXACT match to Unsloth original (NVARC/arc_solver.py)
 # ============================================================================
-LORA_R = 256
-LORA_ALPHA = 32
+LORA_R = 16
+LORA_ALPHA = 16
 LORA_DROPOUT = 0.0
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 LORA_MODULES_TO_SAVE = ["embed_tokens", "lm_head"]  # Fully fine-tuned, not LoRA
@@ -121,7 +121,7 @@ TTT_BATCH_SIZE = 1
 TTT_GRAD_ACCUM_STEPS = 1
 TTT_MAX_GRAD_NORM = 1.0
 TTT_WARMUP_RATIO = 0.1
-TTT_AUGMENT_N = 16
+TTT_AUGMENT_N = 2
 TTT_AUGMENT_SEED = 1
 TTT_SHUFFLE_KEYS = True
 
