@@ -1,9 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cu126
 huggingface-hub<1.0
 openai==2.14.0
 requests==2.32.5
 tenacity>6.0.0
-torch==2.7.0+cu126
+# torch installed separately in Dockerfile with CUDA support
 wandb==0.22.0
 numpy==2.3.5
 timm==1.0.22

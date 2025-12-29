@@ -50,6 +50,15 @@ from transformers import (
     DataCollatorForLanguageModeling,
     AutoTokenizer,
     AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+)
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    get_peft_model_state_dict,
+    set_peft_model_state_dict,
+    TaskType,
 )
 
 logging.disable(logging.WARNING)
@@ -91,6 +100,30 @@ USER_TOKEN_ID = 11       # "user"
 ASSISTANT_TOKEN_ID = 12  # "assistant"
 PAD_ID = 13              # <|endoftext|>
 EOS_ID = 15              # <|im_end|>
+
+
+# ============================================================================
+# LoRA Configuration - EXACT match to Unsloth original (NVARC/arc_solver.py)
+# ============================================================================
+LORA_R = 256
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.0
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+LORA_MODULES_TO_SAVE = ["embed_tokens", "lm_head"]  # Fully fine-tuned, not LoRA
+LORA_USE_RSLORA = True
+
+# ============================================================================
+# TTT Training Configuration - EXACT match to Unsloth original
+# ============================================================================
+TTT_LEARNING_RATE = 5e-5
+TTT_NUM_EPOCHS = 1
+TTT_BATCH_SIZE = 1
+TTT_GRAD_ACCUM_STEPS = 1
+TTT_MAX_GRAD_NORM = 1.0
+TTT_WARMUP_RATIO = 0.1
+TTT_AUGMENT_N = 16
+TTT_AUGMENT_SEED = 1
+TTT_SHUFFLE_KEYS = True
 
 
 # ============================================================================
@@ -382,9 +415,35 @@ class NVARCDataset:
 
 
 # ============================================================================
-# Standard Trainer (no Unsloth)
+# FixedTrainer - Replicates UnslothFixedTrainer for DDP gradient safety
 # ============================================================================
-# Using standard transformers Trainer - no custom overrides needed
+
+class FixedTrainer(Trainer):
+    """
+    Trainer with fix for DDP gradient issues.
+
+    Replicates UnslothFixedTrainer behavior from NVARC/arc_solver.py.
+    The original issue: https://github.com/unslothai/unsloth/issues/2435
+
+    The fix clones the loss tensor before in-place operations to avoid
+    tensor view issues during distributed training.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Fixed compute_loss that handles tensor view issues."""
+        outputs = model(**inputs)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # KEY FIX: Clone the loss tensor before in-place operations
+        # This converts view tensor to independent tensor
+        if hasattr(loss, "clone"):
+            loss = loss.clone()
+
+        # Scale loss for DDP (matching original behavior)
+        if self.accelerator.num_processes > 1:
+            loss = loss * self.accelerator.num_processes
+
+        return (loss, outputs) if return_outputs else loss
 
 
 # ============================================================================
@@ -656,8 +715,11 @@ class ARCSolver:
     """
     ARC solver using NVARC (LLM-based) approach with Qwen model.
 
-    IMPORTANT: This is inference-only without TTT (Test-Time Training).
-    The pre-trained model is used directly without adding any LoRA adapter.
+    Supports Test-Time Training (TTT) with PEFT LoRA adapters.
+    TTT fine-tunes a LoRA adapter on each puzzle's training examples
+    before running inference, which improves solving accuracy.
+
+    Hyperparameters exactly match the original Unsloth-based NVARC implementation.
     """
 
     def __init__(
@@ -671,9 +733,14 @@ class ARCSolver:
         inference_augment_n: int = 2,
         inference_timeout: float = 1200.0,  # 20 minutes total per puzzle (original uses end_time)
         beam_threshold: float = 0.1,  # -np.log(0.2) = max_score
+        # TTT hyperparameters (match original NVARC exactly)
+        enable_ttt: bool = True,
+        ttt_learning_rate: float = TTT_LEARNING_RATE,
+        ttt_num_epochs: int = TTT_NUM_EPOCHS,
+        ttt_augment_n: int = TTT_AUGMENT_N,
     ) -> None:
         """
-        Initialize the NVARC solver (inference-only, no TTT).
+        Initialize the NVARC solver with optional Test-Time Training (TTT).
 
         Args:
             checkpoint_path: Direct path to model checkpoint
@@ -684,9 +751,13 @@ class ARCSolver:
             inference_augment_n: Number of augmentations for inference
             inference_timeout: Total timeout for inference in seconds
             beam_threshold: Probability threshold for beam search
+            enable_ttt: Whether to enable Test-Time Training (default: True)
+            ttt_learning_rate: Learning rate for TTT (default: 5e-5)
+            ttt_num_epochs: Number of epochs for TTT (default: 1)
+            ttt_augment_n: Number of augmentations for TTT training data (default: 16)
         """
         print("\n" + "=" * 50)
-        print("NVARC Solver - Inference Only (No TTT)")
+        print(f"NVARC Solver - {'TTT Enabled' if enable_ttt else 'Inference Only'}")
         print("=" * 50)
         print(f"PyTorch version: {torch.__version__}")
         print(f"CUDA available: {torch.cuda.is_available()}")
@@ -705,6 +776,12 @@ class ARCSolver:
         self.inference_augment_n = inference_augment_n
         self.inference_timeout = inference_timeout
         self.max_score = -np.log(beam_threshold)  # Same as original
+
+        # TTT hyperparameters
+        self.enable_ttt = enable_ttt
+        self.ttt_learning_rate = ttt_learning_rate
+        self.ttt_num_epochs = ttt_num_epochs
+        self.ttt_augment_n = ttt_augment_n
 
         # Determine model path
         if checkpoint_path is not None:
@@ -730,17 +807,7 @@ class ARCSolver:
             device_map = "cpu"
             print("WARNING: Loading model to CPU - this will be slow!")
 
-        # Load base model - NO PEFT adapter since we're not doing TTT
-        # The checkpoint should already contain the SFT-trained weights
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map=device_map,
-            local_files_only=(checkpoint_path is not None),
-            trust_remote_code=True,
-        )
-
-        # Load tokenizer
+        # Load tokenizer first (needed for data collator)
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_path,
             local_files_only=(checkpoint_path is not None),
@@ -751,7 +818,92 @@ class ARCSolver:
         print(f"Tokenizer vocab size: {len(self.tokenizer)}")
         print(f"Expected ARC_TOKENS: {ARC_TOKENS}")
 
-        # Set model to eval mode for inference - NO PEFT adapter applied
+        # Load base model
+        base_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map=device_map,
+            local_files_only=(checkpoint_path is not None),
+            trust_remote_code=True,
+        )
+
+        if self.enable_ttt:
+            # Create LoRA config - EXACT match to original Unsloth peft_params
+            lora_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                inference_mode=False,
+                r=LORA_R,
+                lora_alpha=LORA_ALPHA,
+                lora_dropout=LORA_DROPOUT,
+                bias="none",
+                use_rslora=LORA_USE_RSLORA,
+                target_modules=LORA_TARGET_MODULES,
+                modules_to_save=LORA_MODULES_TO_SAVE,
+            )
+
+            # Apply PEFT with deterministic initialization (match random_state=42)
+            torch.manual_seed(42)
+            self.model = get_peft_model(base_model, lora_config)
+
+            # Convert any fp32 params to bf16 (match original behavior)
+            for name, param in self.model.named_parameters():
+                if param.dtype == torch.float32:
+                    param.data = param.data.to(torch.bfloat16)
+
+            # Save default adapter weights for reset between puzzles
+            self.default_adapter_weights = get_peft_model_state_dict(
+                self.model, adapter_name="default"
+            )
+            self.default_adapter_weights = {
+                k: v.clone().detach() for k, v in self.default_adapter_weights.items()
+            }
+
+            # Create TrainingArguments - EXACT match to original train_args
+            self.training_args = TrainingArguments(
+                output_dir="./ttt_output",  # Required but not used (no save)
+                per_device_train_batch_size=TTT_BATCH_SIZE,
+                per_device_eval_batch_size=TTT_BATCH_SIZE,
+                gradient_accumulation_steps=TTT_GRAD_ACCUM_STEPS,
+                num_train_epochs=self.ttt_num_epochs,
+                warmup_steps=0,
+                warmup_ratio=TTT_WARMUP_RATIO,
+                max_grad_norm=TTT_MAX_GRAD_NORM,
+                learning_rate=self.ttt_learning_rate,
+                optim="adamw_torch",
+                weight_decay=0.0,
+                lr_scheduler_type="cosine",
+                seed=42,
+                bf16=True,
+                fp16=False,
+                report_to="none",
+                save_strategy="no",
+                eval_strategy="no",
+                logging_strategy="no",
+                ddp_find_unused_parameters=False,
+                dataloader_num_workers=0,
+                gradient_checkpointing=False,
+                remove_unused_columns=False,  # Important for custom collator
+            )
+
+            # Data collator for TTT - only compute loss on assistant completions
+            self.ttt_collator = QwenDataCollatorForCompletionOnlyLM(
+                tokenizer=self.tokenizer,
+                mlm=False,
+            )
+
+            print(f"PEFT LoRA adapter applied:")
+            print(f"  r={LORA_R}, alpha={LORA_ALPHA}, use_rslora={LORA_USE_RSLORA}")
+            print(f"  target_modules={LORA_TARGET_MODULES}")
+            print(f"  modules_to_save={LORA_MODULES_TO_SAVE}")
+            self.model.print_trainable_parameters()
+        else:
+            # No TTT - use base model directly
+            self.model = base_model
+            self.default_adapter_weights = None
+            self.training_args = None
+            self.ttt_collator = None
+
+        # Set model to eval mode for inference
         self.model.eval()
 
         # Create formatter - exactly as original
@@ -761,7 +913,118 @@ class ARCSolver:
         if torch.cuda.is_available():
             print(f"GPU Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
 
-        print(f"NVARC ARCSolver initialized on {self.device} (inference-only, no TTT)")
+        ttt_status = "TTT enabled" if self.enable_ttt else "inference-only"
+        print(f"NVARC ARCSolver initialized on {self.device} ({ttt_status})")
+
+    def _run_ttt(self, puzzle_ds: NVARCDataset) -> bool:
+        """
+        Run test-time training on puzzle training examples.
+
+        Matches original NVARC exactly:
+        - Augmentation: n=16, shfl_keys=True, seed=1
+        - Training: 1 epoch with the specified hyperparameters
+        - Uses LoRA adapter that resets between puzzles
+
+        Args:
+            puzzle_ds: Dataset containing the puzzle's training examples
+
+        Returns:
+            True on success, False on failure (falls back to inference-only)
+        """
+        if not self.enable_ttt or self.default_adapter_weights is None:
+            return False
+
+        try:
+            torch.cuda.reset_peak_memory_stats()
+
+            # Reset adapter weights to default (match original line 317-321)
+            load_result = set_peft_model_state_dict(
+                self.model,
+                {k: v.clone() for k, v in self.default_adapter_weights.items()},
+                adapter_name="default",
+            )
+
+            # Set model to training mode (equivalent to FastLanguageModel.for_training)
+            self.model.train()
+
+            # Augment training data - EXACT match to original (n=16, shfl_keys=True, seed=1)
+            train_ds = puzzle_ds.augment(n=self.ttt_augment_n, shfl_keys=TTT_SHUFFLE_KEYS, seed=TTT_AUGMENT_SEED)
+            train_ds = train_ds.cut_to_len(
+                formatter=self.formatter,
+                name="text",
+                max_len=self.max_seq_length
+            )
+
+            # Create HuggingFace Dataset
+            hf_dataset = Dataset.from_list(train_ds.as_list(self.formatter))
+
+            # Tokenize dataset
+            def tokenize_fn(examples):
+                return self.tokenizer(
+                    examples["text"],
+                    truncation=True,
+                    max_length=self.max_seq_length,
+                    padding=False,
+                )
+
+            tokenized_ds = hf_dataset.map(
+                tokenize_fn,
+                batched=True,
+                remove_columns=hf_dataset.column_names,
+            )
+
+            # Train with suppressed output (match original)
+            with io.StringIO() as buf, redirect_stdout(buf), redirect_stderr(buf):
+                trainer = FixedTrainer(
+                    model=self.model,
+                    args=self.training_args,
+                    train_dataset=tokenized_ds,
+                    data_collator=self.ttt_collator,
+                    tokenizer=self.tokenizer,
+                )
+
+                stats = trainer.train()
+
+                # Unwrap model from accelerator (match original line 344)
+                self.model = trainer.accelerator.unwrap_model(
+                    trainer.model,
+                    keep_fp32_wrapper=False
+                )
+
+                del trainer
+
+            # Set to eval mode for inference (equivalent to FastLanguageModel.for_inference)
+            self.model.eval()
+
+            # Cleanup
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            memory_allocated = torch.cuda.max_memory_allocated() // 1024**2
+            print(f"TTT complete - allocated {memory_allocated}MB for training")
+
+            return True
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"CUDA OOM during TTT, falling back to inference-only")
+            else:
+                print(f"TTT failed with error: {e}")
+
+            # Reset weights and continue with inference
+            try:
+                set_peft_model_state_dict(
+                    self.model,
+                    {k: v.clone() for k, v in self.default_adapter_weights.items()},
+                    adapter_name="default",
+                )
+            except Exception:
+                pass
+
+            self.model.eval()
+            gc.collect()
+            torch.cuda.empty_cache()
+            return False
 
     def solve(
         self,
@@ -769,7 +1032,11 @@ class ARCSolver:
         test_input: List[List[int]],
     ) -> List[List[int]]:
         """
-        Solve an ARC task.
+        Solve an ARC task with optional Test-Time Training (TTT).
+
+        If TTT is enabled, the model first fine-tunes a LoRA adapter on the
+        training examples before running inference. This improves accuracy
+        by adapting the model to the specific task.
 
         Args:
             train_examples: List of {'input': grid, 'output': grid}
@@ -785,6 +1052,8 @@ class ARCSolver:
         task_key = "puzzle"
 
         # Build dataset from examples
+        # Note: replies are NOT set here - they're only used during scoring in _run_inference
+        # TTT trains on the training examples which are already complete input-output pairs
         queries = {
             task_key: {
                 "train": train_examples,
@@ -797,6 +1066,15 @@ class ARCSolver:
         # Clean up memory
         gc.collect()
         torch.cuda.empty_cache()
+
+        # Run TTT if enabled
+        if self.enable_ttt:
+            print(f"Running TTT on {len(train_examples)} training examples...")
+            ttt_success = self._run_ttt(puzzle_ds)
+            if ttt_success:
+                print("TTT completed successfully")
+            else:
+                print("TTT failed, proceeding with inference-only")
 
         # Run inference
         predictions = self._run_inference(puzzle_ds, start_time, end_time)
