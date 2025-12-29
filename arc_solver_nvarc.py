@@ -670,7 +670,7 @@ class ARCSolver:
         # Inference hyperparameters (match original NVARC)
         inference_augment_n: int = 2,
         inference_timeout: float = 1200.0,  # 20 minutes total per puzzle (original uses end_time)
-        beam_threshold: float = 0.2,  # -np.log(0.2) = max_score
+        beam_threshold: float = 0.1,  # -np.log(0.2) = max_score
     ) -> None:
         """
         Initialize the NVARC solver (inference-only, no TTT).
